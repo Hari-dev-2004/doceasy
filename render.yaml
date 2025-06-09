@@ -3,9 +3,13 @@ services:
     name: doceasy-backend
     env: python
     buildCommand: pip install -r backend/requirements.txt
-    startCommand: cd backend && gunicorn app:create_app()
+    startCommand: cd backend && gunicorn wsgi:app
     envVars:
       - key: MONGODB_URI
         value: mongodb+srv://subrahmanyag79:dhDShm338VxoPMUz@doceasy.kp4oh2g.mongodb.net/?retryWrites=true&w=majority&appName=doceasy
       - key: PYTHON_VERSION
-        value: 3.9.18 
+        value: 3.9.18
+      - key: PORT
+        value: 10000
+      - key: FLASK_APP
+        value: backend/app.py 

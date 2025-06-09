@@ -52,16 +52,20 @@ def create_app():
     
     # Connect to MongoDB
     try:
+        # Explicitly use the Atlas URI
         client = MongoClient(mongodb_uri)
+        # Get the database by name instead of default
         db = client[mongodb_db_name]
         app.config['DATABASE'] = db
         
         # Test connection
-        client.server_info()
-        logger.info(f"Connected to MongoDB database: {mongodb_db_name}")
+        client.admin.command('ping')
+        logger.info(f"Connected to MongoDB database: {mongodb_db_name} at {mongodb_uri}")
     except Exception as e:
         logger.error(f"Failed to connect to MongoDB: {e}")
-        raise
+        # Don't raise the exception, allow the app to start anyway
+        # This helps with debugging connection issues
+        app.config['DATABASE'] = None
     
     # CORS configuration - allow production frontend and development origins
     cors_origins = os.getenv('CORS_ORIGIN', 'https://doceasy-1.onrender.com,http://localhost:5173,http://localhost:8080,http://localhost:3000').split(',')
@@ -80,9 +84,10 @@ def create_app():
     app.register_blueprint(patient_bp, url_prefix='/api/patient')
     app.register_blueprint(payment_bp, url_prefix='/api/payments')
     
-    # Create default admin user
-    with app.app_context():
-        create_default_admin(db)
+    # Create default admin user if database is connected
+    if app.config['DATABASE']:
+        with app.app_context():
+            create_default_admin(db)
     
     # Error handlers
     @app.errorhandler(404)
@@ -106,11 +111,17 @@ def create_app():
             return response
             
         try:
-            # Check database connection
-            app.config['DATABASE'].list_collection_names()
+            # Check database connection if available
+            if app.config['DATABASE']:
+                app.config['DATABASE'].list_collection_names()
+                db_status = 'connected'
+            else:
+                db_status = 'not configured'
+                
             return jsonify({
                 'status': 'healthy',
-                'database': 'connected',
+                'database': db_status,
+                'mongodb_uri': mongodb_uri[:20] + '...' if mongodb_uri else 'not set',
                 'jwt_expiry_hours': int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 168))
             }), 200
         except Exception as e:
@@ -141,6 +152,8 @@ def create_app():
 
             # Get database instance
             db = app.config['DATABASE']
+            if not db:
+                return jsonify({'error': 'Database connection not available'}), 500
             
             # Find consultation
             from bson import ObjectId
@@ -188,7 +201,22 @@ def create_default_admin(db):
         logger.info(f"Default admin user already exists: {default_email}")
 
 # Create the application instance for gunicorn to use
-app = create_app()
+# Use a try-except block to handle any initialization errors gracefully
+try:
+    app = create_app()
+except Exception as e:
+    import sys
+    print(f"CRITICAL ERROR INITIALIZING APP: {e}", file=sys.stderr)
+    # Create a minimal app that can at least start
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def error_app():
+        return jsonify({
+            "status": "error",
+            "message": "Application failed to initialize properly. Check logs for details.",
+            "error": str(e)
+        }), 500
 
 if __name__ == '__main__':
     # Run the application

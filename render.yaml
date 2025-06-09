@@ -7,9 +7,23 @@ services:
     envVars:
       - key: MONGODB_URI
         value: mongodb+srv://subrahmanyag79:dhDShm338VxoPMUz@doceasy.kp4oh2g.mongodb.net/?retryWrites=true&w=majority&appName=doceasy
+      - key: MONGODB_DB_NAME
+        value: doceasy
       - key: PYTHON_VERSION
         value: 3.9.18
       - key: PORT
         value: 10000
       - key: FLASK_APP
-        value: backend/app.py 
+        value: backend/app.py
+      - key: FLASK_DEBUG
+        value: false
+      - key: JWT_SECRET_KEY
+        value: secure_jwt_key_for_production
+      - key: SECRET_KEY
+        value: secure_flask_key_for_production
+      - key: JWT_ACCESS_TOKEN_EXPIRES
+        value: 168
+      - key: FRONTEND_URL
+        value: https://doceasy-1.onrender.com
+      - key: CORS_ORIGIN
+        value: https://doceasy-1.onrender.com,http://localhost:5173,http://localhost:8080 

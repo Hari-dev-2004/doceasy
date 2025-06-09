@@ -85,7 +85,7 @@ def create_app():
     app.register_blueprint(payment_bp, url_prefix='/api/payments')
     
     # Create default admin user if database is connected
-    if app.config['DATABASE']:
+    if app.config['DATABASE'] is not None:
         with app.app_context():
             create_default_admin(db)
     
@@ -112,7 +112,7 @@ def create_app():
             
         try:
             # Check database connection if available
-            if app.config['DATABASE']:
+            if app.config['DATABASE'] is not None:
                 app.config['DATABASE'].list_collection_names()
                 db_status = 'connected'
             else:
@@ -152,7 +152,7 @@ def create_app():
 
             # Get database instance
             db = app.config['DATABASE']
-            if not db:
+            if db is None:
                 return jsonify({'error': 'Database connection not available'}), 500
             
             # Find consultation
@@ -204,18 +204,18 @@ def create_default_admin(db):
 # Use a try-except block to handle any initialization errors gracefully
 try:
     app = create_app()
-except Exception as e:
+except Exception as init_error:
     import sys
-    print(f"CRITICAL ERROR INITIALIZING APP: {e}", file=sys.stderr)
+    print(f"CRITICAL ERROR INITIALIZING APP: {init_error}", file=sys.stderr)
     # Create a minimal app that can at least start
     app = Flask(__name__)
     
-    @app.route('/')
+    @app.route('/', methods=['GET', 'HEAD', 'OPTIONS'])
     def error_app():
         return jsonify({
             "status": "error",
             "message": "Application failed to initialize properly. Check logs for details.",
-            "error": str(e)
+            "error": str(init_error)
         }), 500
 
 if __name__ == '__main__':

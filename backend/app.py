@@ -187,9 +187,10 @@ def create_default_admin(db):
     else:
         logger.info(f"Default admin user already exists: {default_email}")
 
+# Create the application instance for gunicorn to use
+app = create_app()
+
 if __name__ == '__main__':
-    app = create_app()
-    
     # Run the application
     host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', 5000))
@@ -198,7 +199,4 @@ if __name__ == '__main__':
     logger.info(f"Starting Flask application on {host}:{port}")
     
     # Disable automatic .env loading to avoid encoding issues
-    import sys
-    sys.argv.append('--without-threads')  # Add any dummy argument to prevent CLI from loading .env
-    
-    app.run(host=host, port=port, debug=debug, load_dotenv=False) 
+    app.run(host=host, port=port, debug=debug) 

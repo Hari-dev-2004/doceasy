@@ -3,7 +3,7 @@ services:
     name: doceasy-backend
     env: python
     buildCommand: pip install -r backend/requirements.txt
-    startCommand: cd backend && gunicorn wsgi:app
+    startCommand: cd backend && gunicorn app:app
     envVars:
       - key: MONGODB_URI
         value: mongodb+srv://subrahmanyag79:dhDShm338VxoPMUz@doceasy.kp4oh2g.mongodb.net/?retryWrites=true&w=majority&appName=doceasy

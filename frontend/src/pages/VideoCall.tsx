@@ -63,6 +63,10 @@ const VideoCall = () => {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [securityVerified, setSecurityVerified] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('Initializing...');
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [hasLocalVideo, setHasLocalVideo] = useState(false);
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
+  const [lastConnectAttempt, setLastConnectAttempt] = useState<Date | null>(null);
 
   // WebRTC
   const webrtcRef = useRef<WebRTCCall | null>(null);
@@ -128,35 +132,114 @@ const VideoCall = () => {
   }, [callActive, callStartTime]);
 
   useEffect(() => {
-    // Function to handle video element resizing and fitting
-    const handleVideoDisplay = () => {
-      if (localVideoRef.current && localVideoRef.current.srcObject) {
-        console.log("Configuring local video display");
+    // Function to handle media stream issues with a retry mechanism
+    const checkAndFixVideoDisplay = () => {
+      console.log("Checking video elements...");
+      
+      // Check local video
+      if (localVideoRef.current) {
+        if (!localVideoRef.current.srcObject && webrtcRef.current?.localStream) {
+          console.log("Fixing local video stream");
+          localVideoRef.current.srcObject = webrtcRef.current.localStream;
+          setHasLocalVideo(true);
+          
+          // Force play (needed for some mobile browsers)
+          localVideoRef.current.play().catch(e => {
+            console.warn("Local video autoplay failed:", e);
+          });
+        }
       }
       
-      if (remoteVideoRef.current && remoteVideoRef.current.srcObject) {
-        console.log("Configuring remote video display");
+      // Check remote video
+      if (remoteVideoRef.current) {
+        if (remoteVideoRef.current.srcObject && !hasRemoteVideo) {
+          console.log("Remote video stream detected");
+          setHasRemoteVideo(true);
+          
+          // Force play (needed for some mobile browsers)
+          remoteVideoRef.current.play().catch(e => {
+            console.warn("Remote video autoplay failed:", e);
+          });
+        }
+        
+        // Check if we need to reconnect
+        if (!remoteVideoRef.current.srcObject && callActive && 
+            reconnectAttempts < 3 && connectionStatus !== 'Connection error') {
+          
+          // Avoid too frequent reconnection attempts
+          const now = new Date();
+          if (!lastConnectAttempt || (now.getTime() - lastConnectAttempt.getTime() > 10000)) {
+            console.log("No remote video stream, attempting reconnection");
+            setConnectionStatus('Reconnecting...');
+            setLastConnectAttempt(now);
+            setReconnectAttempts(prev => prev + 1);
+            
+            // Attempt to restart the call
+            if (webrtcRef.current) {
+              webrtcRef.current.endCall().then(() => {
+                setTimeout(() => startCall(), 1000);
+              });
+            } else {
+              startCall();
+            }
+          }
+        }
       }
     };
     
-    // Add event listeners for video loading
-    if (localVideoRef.current) {
-      localVideoRef.current.onloadedmetadata = handleVideoDisplay;
-    }
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.onloadedmetadata = handleVideoDisplay;
+    // Set up interval to check video status
+    const checkInterval = setInterval(checkAndFixVideoDisplay, 5000);
+    
+    // Also check immediately
+    if (callActive) {
+      checkAndFixVideoDisplay();
     }
     
     return () => {
-      // Clean up event listeners
-      if (localVideoRef.current) {
-        localVideoRef.current.onloadedmetadata = null;
+      clearInterval(checkInterval);
+    };
+  }, [callActive, hasRemoteVideo, hasLocalVideo, reconnectAttempts, connectionStatus, lastConnectAttempt]);
+
+  // Handle video element events
+  useEffect(() => {
+    const handleLoadedMetadata = () => {
+      console.log("Video loaded metadata");
+    };
+    
+    const handlePlaying = () => {
+      console.log("Video is playing");
+      if (remoteVideoRef.current === document.activeElement) {
+        setHasRemoteVideo(true);
       }
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.onloadedmetadata = null;
+      if (localVideoRef.current === document.activeElement) {
+        setHasLocalVideo(true);
       }
     };
-  }, [callActive, videoEnabled]);
+    
+    // Set up event listeners
+    if (localVideoRef.current) {
+      localVideoRef.current.onloadedmetadata = handleLoadedMetadata;
+      localVideoRef.current.onplaying = handlePlaying;
+    }
+    
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.onloadedmetadata = handleLoadedMetadata;
+      remoteVideoRef.current.onplaying = handlePlaying;
+    }
+    
+    return () => {
+      // Remove event listeners
+      if (localVideoRef.current) {
+        localVideoRef.current.onloadedmetadata = null;
+        localVideoRef.current.onplaying = null;
+      }
+      
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.onloadedmetadata = null;
+        remoteVideoRef.current.onplaying = null;
+      }
+    };
+  }, [callActive]);
 
   const fetchConsultationData = async (user: any) => {
     if (!appointmentId) return;
@@ -226,6 +309,17 @@ const VideoCall = () => {
     
     try {
       setConnectionStatus('Initializing call...');
+      
+      // Cleanup any existing WebRTC call
+      if (webrtcRef.current) {
+        await webrtcRef.current.endCall();
+        webrtcRef.current = null;
+      }
+      
+      // Reset video states
+      setHasLocalVideo(false);
+      setHasRemoteVideo(false);
+      
       // Create WebRTC call instance
       const videoCallId = consultation.video_call_id || `call_${appointmentId}`;
       
@@ -233,31 +327,55 @@ const VideoCall = () => {
         roomId: videoCallId,
         appointmentId: appointmentId || '',
         onLocalStream: (stream) => {
+          console.log("Got local stream with tracks:", 
+                     stream.getVideoTracks().length, "video,", 
+                     stream.getAudioTracks().length, "audio");
+          
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
-            console.log("Local video stream set", stream.getVideoTracks()[0]?.enabled);
+            setHasLocalVideo(true);
             
             // Ensure video tracks are properly enabled
             stream.getVideoTracks().forEach(track => {
               track.enabled = videoEnabled;
             });
+            
+            // Force play on mobile devices
+            localVideoRef.current.play().catch(e => {
+              console.warn("Local video autoplay failed:", e);
+            });
           }
           setConnectionStatus('Connecting to peer...');
         },
         onRemoteStream: (stream) => {
+          console.log("Got remote stream with tracks:", 
+                     stream.getVideoTracks().length, "video,", 
+                     stream.getAudioTracks().length, "audio");
+          
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = stream;
-            console.log("Remote video stream set", stream.getVideoTracks()[0]?.enabled);
+            setHasRemoteVideo(true);
             
-            // Force play the video if needed
+            // Force play the video
             remoteVideoRef.current.play().catch(e => {
-              console.warn("Auto-play failed, user interaction may be needed:", e);
+              console.warn("Remote video autoplay failed:", e);
+              // Try again after a user gesture
+              const unlockAudioAndVideo = () => {
+                remoteVideoRef.current?.play();
+                document.body.removeEventListener('click', unlockAudioAndVideo);
+                document.body.removeEventListener('touchstart', unlockAudioAndVideo);
+              };
+              
+              document.body.addEventListener('click', unlockAudioAndVideo);
+              document.body.addEventListener('touchstart', unlockAudioAndVideo);
             });
           }
           setConnectionStatus('Connected');
         },
         onPeerConnected: () => {
           setConnectionStatus('Connected');
+          setCallActive(true);
+          setCallStartTime(new Date());
           toast({
             title: "Connected",
             description: "You are now connected to the consultation"
@@ -317,6 +435,9 @@ const VideoCall = () => {
     setCallActive(false);
     setCallStartTime(null);
     setCallDuration('00:00');
+    setHasLocalVideo(false);
+    setHasRemoteVideo(false);
+    setReconnectAttempts(0);
     
     toast({
       title: "Call Ended",
@@ -341,15 +462,6 @@ const VideoCall = () => {
       webrtcRef.current.toggleVideo(newVideoState);
     }
     
-    // Also directly modify any local video tracks for immediate feedback
-    if (localVideoRef.current && localVideoRef.current.srcObject) {
-      const stream = localVideoRef.current.srcObject as MediaStream;
-      const videoTracks = stream.getVideoTracks();
-      videoTracks.forEach(track => {
-        track.enabled = newVideoState;
-      });
-    }
-    
     toast({
       title: newVideoState ? "Video Enabled" : "Video Disabled",
       description: newVideoState ? "Your camera is now on" : "Your camera is now off",
@@ -357,15 +469,16 @@ const VideoCall = () => {
   };
 
   const toggleAudio = () => {
+    const newAudioState = !audioEnabled;
+    setAudioEnabled(newAudioState);
+    
     if (webrtcRef.current) {
-      webrtcRef.current.toggleAudio(!audioEnabled);
+      webrtcRef.current.toggleAudio(newAudioState);
     }
     
-    setAudioEnabled(!audioEnabled);
-    
     toast({
-      title: audioEnabled ? "Microphone Muted" : "Microphone Unmuted",
-      description: audioEnabled ? "Your microphone is now muted" : "Your microphone is now unmuted",
+      title: newAudioState ? "Microphone Unmuted" : "Microphone Muted",
+      description: newAudioState ? "Your microphone is now unmuted" : "Your microphone is now muted",
     });
   };
 
@@ -524,12 +637,15 @@ const VideoCall = () => {
                   {/* Video feeds */}
                   <div className="flex-grow flex">
                     {/* Remote participant video (main) */}
-                    <div className="flex-grow bg-gray-800 relative border border-gray-600 rounded-lg mx-4 my-4">
-                      {connectionStatus !== 'Connected' && (
+                    <div className="flex-grow bg-gray-800 relative border border-gray-600 rounded-lg mx-4 my-4 overflow-hidden">
+                      {(connectionStatus !== 'Connected' || !hasRemoteVideo) && (
                         <div className="absolute inset-0 flex flex-col items-center justify-center z-10 bg-gray-800/70">
                           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mb-4"></div>
                           <h3 className="text-white text-xl font-medium">{connectionStatus}</h3>
                           <p className="text-gray-300 mt-2">Waiting for {otherParticipantName} to join...</p>
+                          {reconnectAttempts > 0 && (
+                            <p className="text-gray-400 mt-1 text-sm">Reconnection attempt {reconnectAttempts}/3</p>
+                          )}
                         </div>
                       )}
 
@@ -591,7 +707,7 @@ const VideoCall = () => {
             {/* Self Video (small overlay) */}
             {callActive && (
               <div className="absolute bottom-20 right-8 w-36 h-48 bg-gray-700 rounded-lg border border-gray-600 overflow-hidden">
-                {videoEnabled ? (
+                {videoEnabled && hasLocalVideo ? (
                   <video
                     ref={localVideoRef}
                     className="w-full h-full object-contain"

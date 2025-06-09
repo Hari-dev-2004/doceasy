@@ -1,12 +1,26 @@
 import axios from 'axios';
+import { API_URL } from '../config';
 
-// Configuration for WebRTC peers
+// Configuration for WebRTC peers with more STUN/TURN servers for better connectivity
 const PEER_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { 
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
   ],
+  iceCandidatePoolSize: 10
 };
 
 interface VideoCallOptions {
@@ -31,7 +45,7 @@ class WebRTCCall {
   private roomId: string;
   private appointmentId: string;
   private peerConnection: RTCPeerConnection | null = null;
-  private localStream: MediaStream | null = null;
+  localStream: MediaStream | null = null; // Made public for access from VideoCall component
   private remoteStream: MediaStream | null = null;
   private isPolling: boolean = false;
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
@@ -40,6 +54,10 @@ class WebRTCCall {
   private participantId: string | null = null;
   private userId: string | null = null;
   private isConnected: boolean = false;
+  private hasReceivedRemoteTrack: boolean = false;
+  private reconnectAttempts: number = 0;
+  private maxReconnectAttempts: number = 5;
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   
   // Callbacks
   private onLocalStreamCallback: ((stream: MediaStream) => void) | null = null;
@@ -63,28 +81,44 @@ class WebRTCCall {
    */
   async initialize(): Promise<void> {
     try {
+      console.log('Initializing WebRTC call...');
       // Join the room first to get participant ID
       await this.joinRoom();
       
-      // Request local media
-      this.localStream = await navigator.mediaDevices.getUserMedia({ 
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: 'user'
-        }, 
-        audio: true 
-      });
+      // Request local media with explicit constraints
+      try {
+        this.localStream = await navigator.mediaDevices.getUserMedia({ 
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: 'user'
+          }, 
+          audio: true 
+        });
+        console.log('Got local media stream:', this.localStream);
+      } catch (mediaError) {
+        console.error('Failed to get video, trying audio only:', mediaError);
+        // Fallback to audio only
+        try {
+          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          console.log('Got audio-only local media stream');
+        } catch (audioError) {
+          console.error('Failed to get any media stream:', audioError);
+          throw new Error('Cannot access camera or microphone');
+        }
+      }
       
       // Set up remote stream container
       this.remoteStream = new MediaStream();
       
       // Create RTCPeerConnection
       this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
+      console.log('Created peer connection with config:', PEER_CONFIG);
       
       // Add local tracks to peer connection
       this.localStream.getTracks().forEach(track => {
         if (this.localStream && this.peerConnection) {
+          console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
           this.peerConnection.addTrack(track, this.localStream);
         }
       });
@@ -92,10 +126,13 @@ class WebRTCCall {
       // Handle ICE candidates
       this.peerConnection.onicecandidate = event => {
         if (event.candidate) {
+          console.log('Generated ICE candidate:', event.candidate);
           this.sendSignal({
             type: 'candidate',
             candidate: event.candidate
           });
+        } else {
+          console.log('All ICE candidates have been generated');
         }
       };
       
@@ -106,30 +143,68 @@ class WebRTCCall {
         if (this.peerConnection?.iceConnectionState === 'connected' || 
             this.peerConnection?.iceConnectionState === 'completed') {
           if (!this.isConnected) {
+            console.log('ICE connection established');
             this.isConnected = true;
             this.onPeerConnectedCallback?.();
           }
-        } else if (this.peerConnection?.iceConnectionState === 'disconnected' || 
-                  this.peerConnection?.iceConnectionState === 'failed' || 
-                  this.peerConnection?.iceConnectionState === 'closed') {
+        } else if (this.peerConnection?.iceConnectionState === 'disconnected') {
+          console.log('ICE connection disconnected, may recover...');
+          // Wait to see if it recovers before notifying disconnect
+          setTimeout(() => {
+            if (this.peerConnection?.iceConnectionState === 'disconnected') {
+              this.tryReconnect();
+            }
+          }, 5000);
+        } else if (this.peerConnection?.iceConnectionState === 'failed' || 
+                   this.peerConnection?.iceConnectionState === 'closed') {
+          console.log('ICE connection failed or closed');
           if (this.isConnected) {
             this.isConnected = false;
             this.onPeerDisconnectedCallback?.();
+            this.tryReconnect();
           }
         }
+      };
+      
+      // Listen for connection state changes too
+      this.peerConnection.onconnectionstatechange = () => {
+        console.log('Connection state:', this.peerConnection?.connectionState);
+        if (this.peerConnection?.connectionState === 'connected') {
+          console.log('Peer connection fully established');
+        }
+      };
+      
+      // Monitor signaling state
+      this.peerConnection.onsignalingstatechange = () => {
+        console.log('Signaling state:', this.peerConnection?.signalingState);
       };
       
       // Handle remote tracks
       this.peerConnection.ontrack = event => {
-        console.log('Received remote track', event);
-        if (event.streams && event.streams[0]) {
-          this.remoteStream = event.streams[0];
-          this.onRemoteStreamCallback?.(this.remoteStream);
+        console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled);
+        this.hasReceivedRemoteTrack = true;
+        
+        // Always add to our remote stream
+        if (this.remoteStream) {
+          event.track.onunmute = () => {
+            console.log('Remote track unmuted:', event.track.kind);
+          };
+          
+          this.remoteStream.addTrack(event.track);
+        }
+        
+        // Notify about the remote stream
+        if (this.remoteStream && this.onRemoteStreamCallback) {
+          console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
+          this.onRemoteStreamCallback(this.remoteStream);
         }
       };
       
       // Share the local stream with the component
-      this.onLocalStreamCallback?.(this.localStream);
+      if (this.localStream && this.onLocalStreamCallback) {
+        console.log('Calling onLocalStream callback with stream:', this.localStream.id);
+        this.onLocalStreamCallback(this.localStream);
+      }
       
       // Start polling for signaling messages
       this.startPolling();
@@ -139,9 +214,40 @@ class WebRTCCall {
       
     } catch (error) {
       console.error('Error initializing WebRTC call:', error);
-      this.onErrorCallback?.(error as Error);
+      this.onErrorCallback?.(error instanceof Error ? error : new Error(String(error)));
       throw error;
     }
+  }
+  
+  /**
+   * Attempt to reconnect the call
+   */
+  private tryReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.log('Max reconnect attempts reached, giving up');
+      this.onPeerDisconnectedCallback?.();
+      return;
+    }
+    
+    this.reconnectAttempts++;
+    console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+    
+    // Clear previous timeout if any
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    
+    // Try to reconnect after short delay
+    this.reconnectTimeout = setTimeout(async () => {
+      if (!this.isConnected && this.peerConnection) {
+        try {
+          console.log('Creating new offer to reconnect');
+          await this.createAndSendOffer();
+        } catch (error) {
+          console.error('Reconnect attempt failed:', error);
+        }
+      }
+    }, 2000);
   }
   
   /**
@@ -155,7 +261,7 @@ class WebRTCCall {
       }
       
       const response = await axios.post(
-        `/api/webrtc/rooms/${this.roomId}/join`,
+        `${API_URL}/api/webrtc/rooms/${this.roomId}/join`,
         { appointment_id: this.appointmentId },
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -181,19 +287,21 @@ class WebRTCCall {
         throw new Error('No authentication token found');
       }
       
-      const response = await axios.get(`/api/webrtc/rooms/${this.roomId}`, {
+      const response = await axios.get(`${API_URL}/api/webrtc/rooms/${this.roomId}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       
+      console.log('Room status:', response.data);
+      
       // If we have exactly 1 participant (just us), we'll be the call initiator
-      // If we have 2+ participants, we'll wait for an offer
+      // If we have 2+ participants, we'll make an offer regardless of who joined first
       if (response.data.participants === 1) {
         this.isInitiator = true;
         console.log('We are the first participant, will initiate call when others join');
       } else if (response.data.participants >= 2) {
-        console.log('Joining existing call with other participants');
-        // We'll make an offer if we're joining an existing room
-        if (!this.isInitiator && this.peerConnection) {
+        console.log('Multiple participants in room, creating offer');
+        // Always create an offer when joining an existing room with others
+        if (this.peerConnection) {
           await this.createAndSendOffer();
         }
       }
@@ -209,20 +317,25 @@ class WebRTCCall {
     try {
       if (!this.peerConnection) return;
       
-      // Create offer
+      // Create offer with explicit constraints
       const offer = await this.peerConnection.createOffer({
         offerToReceiveAudio: true,
-        offerToReceiveVideo: true
+        offerToReceiveVideo: true,
+        iceRestart: true // Important for reconnection
       });
+      
+      console.log('Created offer:', offer);
       
       // Set local description
       await this.peerConnection.setLocalDescription(offer);
+      console.log('Set local description from offer');
       
       // Send offer through signaling channel
       this.sendSignal({
         type: 'offer',
         sdp: this.peerConnection.localDescription
       });
+      console.log('Sent offer via signaling');
       
     } catch (error) {
       console.error('Error creating offer:', error);
@@ -236,6 +349,7 @@ class WebRTCCall {
   private startPolling(): void {
     if (this.isPolling) return;
     
+    console.log('Starting polling for signaling messages');
     this.isPolling = true;
     this.pollingInterval = setInterval(() => {
       this.pollSignalingMessages();
@@ -251,6 +365,7 @@ class WebRTCCall {
       this.pollingInterval = null;
     }
     this.isPolling = false;
+    console.log('Stopped polling for signaling messages');
   }
   
   /**
@@ -264,9 +379,9 @@ class WebRTCCall {
       }
       
       // Add since parameter if we have a lastMessageTimestamp
-      let url = `/api/webrtc/rooms/${this.roomId}/messages`;
+      let url = `${API_URL}/api/webrtc/rooms/${this.roomId}/messages`;
       if (this.lastMessageTimestamp) {
-        url += `?since=${this.lastMessageTimestamp}`;
+        url += `?since=${encodeURIComponent(this.lastMessageTimestamp)}`;
       }
       
       const response = await axios.get(url, {
@@ -274,6 +389,9 @@ class WebRTCCall {
       });
       
       const messages: SignalingMessage[] = response.data.messages || [];
+      if (messages.length > 0) {
+        console.log(`Received ${messages.length} signaling messages`);
+      }
       this.lastMessageTimestamp = response.data.server_time;
       
       // Process each message that isn't from us
@@ -286,7 +404,7 @@ class WebRTCCall {
       // Make offer as initiator if needed - this handles the case where we're waiting for peers
       if (this.isInitiator && !this.isConnected && this.peerConnection?.connectionState !== 'connecting') {
         // Check if there are others in the room now
-        const roomResponse = await axios.get(`/api/webrtc/rooms/${this.roomId}`, {
+        const roomResponse = await axios.get(`${API_URL}/api/webrtc/rooms/${this.roomId}`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         
@@ -294,6 +412,12 @@ class WebRTCCall {
           console.log('Another participant joined, initiating call as first participant');
           await this.createAndSendOffer();
         }
+      }
+      
+      // If we've been connected for a while but don't have remote tracks, try to reconnect
+      if (this.isConnected && !this.hasReceivedRemoteTrack && this.peerConnection) {
+        console.log('Connected but no remote track received, trying to reconnect');
+        this.tryReconnect();
       }
       
     } catch (error) {
@@ -309,27 +433,36 @@ class WebRTCCall {
       if (!this.peerConnection) return;
       
       const signal = message.signal;
+      console.log('Handling signal type:', signal.type);
       
       if (signal.type === 'offer') {
+        console.log('Received offer from remote peer');
         // Set remote description from offer
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        console.log('Set remote description from offer');
         
         // Create and send answer
         const answer = await this.peerConnection.createAnswer();
         await this.peerConnection.setLocalDescription(answer);
+        console.log('Created and set local description from answer');
         
         this.sendSignal({
           type: 'answer',
           sdp: this.peerConnection.localDescription
         });
+        console.log('Sent answer via signaling');
         
       } else if (signal.type === 'answer') {
+        console.log('Received answer from remote peer');
         // Set remote description from answer
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        console.log('Set remote description from answer');
         
       } else if (signal.type === 'candidate') {
+        console.log('Received ICE candidate from remote peer');
         // Add ICE candidate
         await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        console.log('Added ICE candidate');
       }
       
     } catch (error) {
@@ -348,7 +481,7 @@ class WebRTCCall {
       }
       
       await axios.post(
-        `/api/webrtc/rooms/${this.roomId}/signal`,
+        `${API_URL}/api/webrtc/rooms/${this.roomId}/signal`,
         {
           signal,
           target_user_id: targetUserId
@@ -366,10 +499,15 @@ class WebRTCCall {
    */
   toggleVideo(enabled: boolean): void {
     if (this.localStream) {
-      const videoTrack = this.localStream.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = enabled;
-      }
+      const videoTracks = this.localStream.getVideoTracks();
+      console.log(`Toggling video to ${enabled ? 'enabled' : 'disabled'}, ${videoTracks.length} tracks`);
+      
+      videoTracks.forEach(track => {
+        track.enabled = enabled;
+        console.log(`Set video track ${track.id} enabled to ${track.enabled}`);
+      });
+    } else {
+      console.warn('Cannot toggle video: no local stream');
     }
   }
   
@@ -378,10 +516,15 @@ class WebRTCCall {
    */
   toggleAudio(enabled: boolean): void {
     if (this.localStream) {
-      const audioTrack = this.localStream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = enabled;
-      }
+      const audioTracks = this.localStream.getAudioTracks();
+      console.log(`Toggling audio to ${enabled ? 'enabled' : 'disabled'}, ${audioTracks.length} tracks`);
+      
+      audioTracks.forEach(track => {
+        track.enabled = enabled;
+        console.log(`Set audio track ${track.id} enabled to ${track.enabled}`);
+      });
+    } else {
+      console.warn('Cannot toggle audio: no local stream');
     }
   }
   
@@ -389,8 +532,15 @@ class WebRTCCall {
    * End the call and clean up resources
    */
   async endCall(): Promise<void> {
+    console.log('Ending call and cleaning up resources');
     // Stop polling
     this.stopPolling();
+    
+    // Clear reconnect timeout if any
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
     
     // Close peer connection
     if (this.peerConnection) {
@@ -400,20 +550,29 @@ class WebRTCCall {
     
     // Stop local stream tracks
     if (this.localStream) {
-      this.localStream.getTracks().forEach(track => track.stop());
+      this.localStream.getTracks().forEach(track => {
+        track.stop();
+        console.log(`Stopped track: ${track.kind} ${track.id}`);
+      });
       this.localStream = null;
     }
     
     // Clear remote stream
     this.remoteStream = null;
+    this.hasReceivedRemoteTrack = false;
+    
+    // Reset connection flags
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
     
     // Leave the room
     try {
       const token = localStorage.getItem('token');
       if (token) {
-        await axios.post(`/api/webrtc/rooms/${this.roomId}/leave`, {}, {
+        await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/leave`, {}, {
           headers: { Authorization: `Bearer ${token}` }
         });
+        console.log('Left WebRTC room');
       }
     } catch (error) {
       console.error('Error leaving room:', error);

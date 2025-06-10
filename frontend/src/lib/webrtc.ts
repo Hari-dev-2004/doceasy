@@ -46,7 +46,7 @@ class WebRTCCall {
   private appointmentId: string;
   private peerConnection: RTCPeerConnection | null = null;
   localStream: MediaStream | null = null; // Made public for access from VideoCall component
-  private remoteStream: MediaStream | null = null;
+  remoteStream: MediaStream | null = null; // Make remoteStream public as well
   private isPolling: boolean = false;
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
   private lastMessageTimestamp: string = '';
@@ -85,6 +85,13 @@ class WebRTCCall {
       // Join the room first to get participant ID
       await this.joinRoom();
       
+      // Create RTCPeerConnection first
+      this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
+      console.log('Created peer connection with config:', PEER_CONFIG);
+      
+      // Set up remote stream container
+      this.remoteStream = new MediaStream();
+      
       // Request local media with explicit constraints
       try {
         this.localStream = await navigator.mediaDevices.getUserMedia({ 
@@ -108,20 +115,13 @@ class WebRTCCall {
         }
       }
       
-      // Set up remote stream container
-      this.remoteStream = new MediaStream();
-      
-      // Create RTCPeerConnection
-      this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
-      console.log('Created peer connection with config:', PEER_CONFIG);
-      
-      // Add local tracks to peer connection
-      this.localStream.getTracks().forEach(track => {
-        if (this.localStream && this.peerConnection) {
+      // Add local tracks to peer connection AFTER creating the peer connection
+      if (this.localStream && this.peerConnection) {
+        this.localStream.getTracks().forEach(track => {
           console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
-          this.peerConnection.addTrack(track, this.localStream);
-        }
-      });
+          this.peerConnection?.addTrack(track, this.localStream!);
+        });
+      }
       
       // Handle ICE candidates
       this.peerConnection.onicecandidate = event => {
@@ -179,24 +179,33 @@ class WebRTCCall {
         console.log('Signaling state:', this.peerConnection?.signalingState);
       };
       
-      // Handle remote tracks
+      // Handle remote tracks - CRITICAL FIX HERE
       this.peerConnection.ontrack = event => {
         console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled);
         this.hasReceivedRemoteTrack = true;
         
-        // Always add to our remote stream
+        // Add track to remote stream
         if (this.remoteStream) {
-          event.track.onunmute = () => {
-            console.log('Remote track unmuted:', event.track.kind);
-          };
+          // Important fix: Use event.streams[0] directly if available
+          if (event.streams && event.streams[0]) {
+            console.log('Using event stream directly');
+            this.remoteStream = event.streams[0];
+          } else {
+            this.remoteStream.addTrack(event.track);
+          }
           
-          this.remoteStream.addTrack(event.track);
+          // Notify about the remote stream
+          if (this.onRemoteStreamCallback) {
+            console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
+            this.onRemoteStreamCallback(this.remoteStream);
+          }
         }
         
-        // Notify about the remote stream
-        if (this.remoteStream && this.onRemoteStreamCallback) {
-          console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
-          this.onRemoteStreamCallback(this.remoteStream);
+        // Ensure we mark as connected when we get tracks
+        if (!this.isConnected) {
+          console.log('Track received, marking as connected');
+          this.isConnected = true;
+          this.onPeerConnectedCallback?.();
         }
       };
       
@@ -293,17 +302,18 @@ class WebRTCCall {
       
       console.log('Room status:', response.data);
       
-      // If we have exactly 1 participant (just us), we'll be the call initiator
-      // If we have 2+ participants, we'll make an offer regardless of who joined first
-      if (response.data.participants === 1) {
-        this.isInitiator = true;
-        console.log('We are the first participant, will initiate call when others join');
-      } else if (response.data.participants >= 2) {
-        console.log('Multiple participants in room, creating offer');
-        // Always create an offer when joining an existing room with others
+      // Important change: Both sides should send offers to avoid deadlock
+      // Each side will process the received offer and send an answer
+      if (response.data.participants >= 2) {
+        console.log('Multiple participants in room, always create offer');
+        // Always create an offer when there are multiple participants
         if (this.peerConnection) {
           await this.createAndSendOffer();
         }
+      } else {
+        // If we're the first, we'll wait and poll for others to join
+        this.isInitiator = true;
+        console.log('We are the first participant, will initiate call when others join');
       }
     } catch (error) {
       console.error('Error checking room status:', error);
@@ -454,24 +464,25 @@ class WebRTCCall {
         
       } else if (signal.type === 'answer') {
         console.log('Received answer from remote peer');
-        // Set remote description from answer
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
         console.log('Set remote description from answer');
         
       } else if (signal.type === 'candidate') {
         console.log('Received ICE candidate from remote peer');
-        // Add ICE candidate
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
-        console.log('Added ICE candidate');
+        if (signal.candidate) {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+          console.log('Added ICE candidate');
+        }
+      } else {
+        console.warn('Unknown signal type:', signal.type);
       }
-      
     } catch (error) {
       console.error('Error handling signaling message:', error);
     }
   }
   
   /**
-   * Send a signaling message to peers
+   * Send a signaling message
    */
   private async sendSignal(signal: any, targetUserId?: string): Promise<void> {
     try {
@@ -495,78 +506,82 @@ class WebRTCCall {
   }
   
   /**
-   * Toggle local video track
+   * Toggle video tracks
    */
   toggleVideo(enabled: boolean): void {
     if (this.localStream) {
       const videoTracks = this.localStream.getVideoTracks();
-      console.log(`Toggling video to ${enabled ? 'enabled' : 'disabled'}, ${videoTracks.length} tracks`);
-      
       videoTracks.forEach(track => {
+        console.log(`Setting video track ${track.id} enabled:`, enabled);
         track.enabled = enabled;
-        console.log(`Set video track ${track.id} enabled to ${track.enabled}`);
       });
-    } else {
-      console.warn('Cannot toggle video: no local stream');
+      
+      // Notify peers that our video state has changed (optional)
+      this.sendSignal({
+        type: 'video-state',
+        enabled: enabled
+      });
     }
   }
   
   /**
-   * Toggle local audio track
+   * Toggle audio tracks
    */
   toggleAudio(enabled: boolean): void {
     if (this.localStream) {
       const audioTracks = this.localStream.getAudioTracks();
-      console.log(`Toggling audio to ${enabled ? 'enabled' : 'disabled'}, ${audioTracks.length} tracks`);
-      
       audioTracks.forEach(track => {
+        console.log(`Setting audio track ${track.id} enabled:`, enabled);
         track.enabled = enabled;
-        console.log(`Set audio track ${track.id} enabled to ${track.enabled}`);
       });
-    } else {
-      console.warn('Cannot toggle audio: no local stream');
+      
+      // Notify peers that our audio state has changed (optional)
+      this.sendSignal({
+        type: 'audio-state',
+        enabled: enabled
+      });
     }
   }
   
   /**
-   * End the call and clean up resources
+   * End the call
    */
   async endCall(): Promise<void> {
-    console.log('Ending call and cleaning up resources');
+    console.log('Ending WebRTC call');
+    
     // Stop polling
     this.stopPolling();
     
-    // Clear reconnect timeout if any
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-    
     // Close peer connection
     if (this.peerConnection) {
+      this.peerConnection.ontrack = null;
+      this.peerConnection.onicecandidate = null;
+      this.peerConnection.oniceconnectionstatechange = null;
+      this.peerConnection.onconnectionstatechange = null;
+      this.peerConnection.onsignalingstatechange = null;
       this.peerConnection.close();
       this.peerConnection = null;
     }
     
-    // Stop local stream tracks
+    // Stop all local tracks
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => {
         track.stop();
-        console.log(`Stopped track: ${track.kind} ${track.id}`);
       });
       this.localStream = null;
     }
     
     // Clear remote stream
     this.remoteStream = null;
-    this.hasReceivedRemoteTrack = false;
     
-    // Reset connection flags
+    // Reset state
     this.isConnected = false;
+    this.hasReceivedRemoteTrack = false;
+    this.isInitiator = false;
     this.reconnectAttempts = 0;
     
-    // Leave the room
     try {
+      // Notify server that we've left
       const token = localStorage.getItem('token');
       if (token) {
         await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/leave`, {}, {

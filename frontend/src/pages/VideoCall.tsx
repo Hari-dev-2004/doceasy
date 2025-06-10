@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { Video, VideoOff, Mic, MicOff, Phone, PhoneOff, MessageCircle, Settings, ArrowLeft, Clock, User, Shield } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, Phone, PhoneOff, MessageCircle, Settings, ArrowLeft, Clock, User, Shield, RefreshCw } from 'lucide-react';
 import { useToast } from "@/components/ui/use-toast";
 import axios from 'axios';
 import Navbar from '@/components/layout/Navbar';
@@ -132,73 +132,86 @@ const VideoCall = () => {
   }, [callActive, callStartTime]);
 
   useEffect(() => {
-    // Function to handle media stream issues with a retry mechanism
-    const checkAndFixVideoDisplay = () => {
-      console.log("Checking video elements...");
+    // When either video ref or webrtc changes, check if we need to set src object
+    if (localVideoRef.current && webrtcRef.current?.localStream) {
+      console.log("Setting local video source object");
+      localVideoRef.current.srcObject = webrtcRef.current.localStream;
       
-      // Check local video
-      if (localVideoRef.current) {
-        if (!localVideoRef.current.srcObject && webrtcRef.current?.localStream) {
-          console.log("Fixing local video stream");
-          localVideoRef.current.srcObject = webrtcRef.current.localStream;
-          setHasLocalVideo(true);
+      // Force play for mobile browsers
+      localVideoRef.current.play().catch(err => {
+        console.warn("Local video autoplay failed:", err);
+      });
+    }
+  }, [localVideoRef.current, webrtcRef.current?.localStream]);
+  
+  // Add a specific effect for handling remote video
+  useEffect(() => {
+    if (remoteVideoRef.current && hasRemoteVideo) {
+      console.log("Checking remote video source object");
+      
+      // If remote video element doesn't have srcObject set, try to force it
+      if (!remoteVideoRef.current.srcObject && webrtcRef.current) {
+        // Force play for mobile browsers
+        remoteVideoRef.current.play().catch(err => {
+          console.warn("Remote video autoplay failed:", err);
+          // Try again with user interaction
+          const unlockVideo = () => {
+            remoteVideoRef.current?.play();
+            document.body.removeEventListener('click', unlockVideo);
+            document.body.removeEventListener('touchstart', unlockVideo);
+          };
           
-          // Force play (needed for some mobile browsers)
-          localVideoRef.current.play().catch(e => {
-            console.warn("Local video autoplay failed:", e);
-          });
-        }
+          document.body.addEventListener('click', unlockVideo);
+          document.body.addEventListener('touchstart', unlockVideo);
+        });
       }
-      
-      // Check remote video
-      if (remoteVideoRef.current) {
-        if (remoteVideoRef.current.srcObject && !hasRemoteVideo) {
-          console.log("Remote video stream detected");
-          setHasRemoteVideo(true);
-          
-          // Force play (needed for some mobile browsers)
-          remoteVideoRef.current.play().catch(e => {
-            console.warn("Remote video autoplay failed:", e);
-          });
-        }
-        
-        // Check if we need to reconnect
-        if (!remoteVideoRef.current.srcObject && callActive && 
-            reconnectAttempts < 3 && connectionStatus !== 'Connection error') {
-          
-          // Avoid too frequent reconnection attempts
-          const now = new Date();
-          if (!lastConnectAttempt || (now.getTime() - lastConnectAttempt.getTime() > 10000)) {
-            console.log("No remote video stream, attempting reconnection");
-            setConnectionStatus('Reconnecting...');
-            setLastConnectAttempt(now);
-            setReconnectAttempts(prev => prev + 1);
-            
-            // Attempt to restart the call
-            if (webrtcRef.current) {
-              webrtcRef.current.endCall().then(() => {
-                setTimeout(() => startCall(), 1000);
-              });
-            } else {
-              startCall();
-            }
+    }
+  }, [remoteVideoRef.current, hasRemoteVideo]);
+
+  // Check and fix video display periodically
+  useEffect(() => {
+    // Periodically check if video is actually displaying content
+    const checkVideoInterval = setInterval(() => {
+      const checkAndFixVideoDisplay = () => {
+        // Check local video
+        if (localVideoRef.current && webrtcRef.current?.localStream) {
+          if (!localVideoRef.current.srcObject) {
+            console.log("Fixing missing local video source");
+            localVideoRef.current.srcObject = webrtcRef.current.localStream;
+            localVideoRef.current.play().catch(e => console.warn("Local autoplay failed:", e));
           }
         }
-      }
-    };
-    
-    // Set up interval to check video status
-    const checkInterval = setInterval(checkAndFixVideoDisplay, 5000);
-    
-    // Also check immediately
-    if (callActive) {
+
+        // Check remote video 
+        if (remoteVideoRef.current && hasRemoteVideo && !remoteVideoRef.current.srcObject) {
+          console.log("Attempting to fix remote video display");
+          
+          // If WebRTC object has access to remote stream
+          if (webrtcRef.current && webrtcRef.current.remoteStream) {
+            console.log("Setting remote stream from WebRTC object");
+            remoteVideoRef.current.srcObject = webrtcRef.current.remoteStream;
+            remoteVideoRef.current.play().catch(e => console.warn("Remote autoplay failed:", e));
+          }
+          
+          // If the call appears connected but no video, try restarting
+          if (connectionStatus === 'Connected' && !hasRemoteVideo && webrtcRef.current) {
+            console.log("Connection appears established but no remote video, trying to restart");
+            setReconnectAttempts(prev => {
+              if (prev < 3) {  // Limit number of auto-restarts
+                startCall();
+                return prev + 1;
+              }
+              return prev;
+            });
+          }
+        }
+      };
+      
       checkAndFixVideoDisplay();
-    }
+    }, 5000);  // Check every 5 seconds
     
-    return () => {
-      clearInterval(checkInterval);
-    };
-  }, [callActive, hasRemoteVideo, hasLocalVideo, reconnectAttempts, connectionStatus, lastConnectAttempt]);
+    return () => clearInterval(checkVideoInterval);
+  }, [hasRemoteVideo, connectionStatus]);
 
   // Handle video element events
   useEffect(() => {
@@ -354,7 +367,7 @@ const VideoCall = () => {
           
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = stream;
-            setHasRemoteVideo(true);
+            setHasRemoteVideo(stream.getVideoTracks().length > 0);
             
             // Force play the video
             remoteVideoRef.current.play().catch(e => {
@@ -397,6 +410,18 @@ const VideoCall = () => {
             description: error.message || "Failed to establish video call",
             variant: "destructive"
           });
+        }
+      });
+      
+      // Make remoteStream accessible to the component
+      webrtc.remoteStream = null;
+      Object.defineProperty(webrtc, 'remoteStream', {
+        get: function() {
+          // This property allows the VideoCall component to access the remote stream
+          if (remoteVideoRef.current) {
+            return remoteVideoRef.current.srcObject;
+          }
+          return null;
         }
       });
       
@@ -480,6 +505,17 @@ const VideoCall = () => {
       title: newAudioState ? "Microphone Unmuted" : "Microphone Muted",
       description: newAudioState ? "Your microphone is now unmuted" : "Your microphone is now muted",
     });
+  };
+
+  // Restart call on reconnect button click
+  const handleReconnect = () => {
+    if (webrtcRef.current) {
+      webrtcRef.current.endCall().then(() => {
+        setTimeout(() => startCall(), 1000);
+      });
+    } else {
+      startCall();
+    }
   };
 
   if (loading) {
@@ -740,6 +776,21 @@ const VideoCall = () => {
           </div>
         </div>
       </div>
+      
+      {/* Add reconnect button if we're having issues */}
+      {callActive && (!hasRemoteVideo || connectionStatus !== 'Connected') && (
+        <div className="absolute top-2 left-1/2 transform -translate-x-1/2 z-50">
+          <Button 
+            variant="destructive" 
+            size="sm" 
+            className="bg-red-600 hover:bg-red-700 text-white shadow-lg"
+            onClick={handleReconnect}
+          >
+            <RefreshCw className="h-4 w-4 mr-1" />
+            Reconnect
+          </Button>
+        </div>
+      )}
       
       <Footer />
     </div>

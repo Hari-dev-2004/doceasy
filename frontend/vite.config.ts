@@ -29,7 +29,7 @@ export default defineConfig(({ mode }) => ({
     // Provide fallback values for production environment variables
     'import.meta.env.VITE_API_URL': JSON.stringify(
       mode === 'production' 
-        ? 'https://doceasy-bcd3.onrender.com'
+        ? 'https://doceasy-1.onrender.com'
         : 'http://localhost:5000'
     ),
   }

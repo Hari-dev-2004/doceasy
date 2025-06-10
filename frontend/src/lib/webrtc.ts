@@ -402,13 +402,31 @@ class WebRTCCall {
       if (messages.length > 0) {
         console.log(`Received ${messages.length} signaling messages`);
       }
-      this.lastMessageTimestamp = response.data.server_time;
       
-      // Process each message that isn't from us
+      // Store the server time for next polling cycle
+      if (response.data.server_time) {
+        this.lastMessageTimestamp = response.data.server_time;
+      }
+      
+      // Use a Set to track processed message IDs and avoid duplicates
+      const processedIds = new Set<string>();
+      
+      // Process each message that isn't from us and hasn't been processed yet
       for (const message of messages) {
-        if (message.user_id !== this.userId) {
-          await this.handleSignalingMessage(message);
-        }
+        // Skip messages from ourselves
+        if (message.user_id === this.userId) continue;
+        
+        // Generate a unique ID for this message to avoid duplicates
+        const messageId = `${message.timestamp}_${message.user_id}_${message.signal?.type}`;
+        
+        // Skip if we've already processed this message
+        if (processedIds.has(messageId)) continue;
+        
+        // Process the message
+        await this.handleSignalingMessage(message);
+        
+        // Mark as processed
+        processedIds.add(messageId);
       }
       
       // Make offer as initiator if needed - this handles the case where we're waiting for peers
@@ -447,6 +465,17 @@ class WebRTCCall {
       
       if (signal.type === 'offer') {
         console.log('Received offer from remote peer');
+        
+        // Check if we can set the remote description in current state
+        const signalingState = this.peerConnection.signalingState;
+        console.log('Current signaling state before processing offer:', signalingState);
+        
+        // If we're not in stable state, reset the connection
+        if (signalingState !== 'stable') {
+          console.log('Resetting connection before processing offer...');
+          await this.peerConnection.setLocalDescription({type: 'rollback'} as RTCSessionDescriptionInit);
+        }
+        
         // Set remote description from offer
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
         console.log('Set remote description from offer');
@@ -464,14 +493,30 @@ class WebRTCCall {
         
       } else if (signal.type === 'answer') {
         console.log('Received answer from remote peer');
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        console.log('Set remote description from answer');
+        
+        // Check if we can set the remote description in current state
+        const signalingState = this.peerConnection.signalingState;
+        console.log('Current signaling state before processing answer:', signalingState);
+        
+        // Only process answer if we're in have-local-offer state
+        if (signalingState === 'have-local-offer') {
+          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          console.log('Set remote description from answer');
+        } else {
+          console.log('Ignoring answer - peer connection not in have-local-offer state');
+        }
         
       } else if (signal.type === 'candidate') {
         console.log('Received ICE candidate from remote peer');
-        if (signal.candidate) {
-          await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
-          console.log('Added ICE candidate');
+        
+        // Only add ice candidate if remote description has been set
+        if (this.peerConnection.remoteDescription) {
+          if (signal.candidate) {
+            await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+            console.log('Added ICE candidate');
+          }
+        } else {
+          console.log('Ignoring ICE candidate - no remote description set yet');
         }
       } else {
         console.warn('Unknown signal type:', signal.type);

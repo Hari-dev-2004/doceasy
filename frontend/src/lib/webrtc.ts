@@ -1,8 +1,9 @@
 import axios from 'axios';
 import { API_URL } from '../config';
+import { io, Socket } from 'socket.io-client';
 
-// Configuration for WebRTC peers with more STUN/TURN servers for better connectivity
-const PEER_CONFIG = {
+// Enhanced configuration for WebRTC peers with more reliable STUN/TURN servers
+const PEER_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -18,9 +19,21 @@ const PEER_CONFIG = {
       urls: 'turn:openrelay.metered.ca:443',
       username: 'openrelayproject',
       credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:turn.anyfirewall.com:443?transport=tcp',
+      username: 'webrtc',
+      credential: 'webrtc'
+    },
+    {
+      urls: 'turn:numb.viagenie.ca:3478',
+      username: 'webrtc@live.com',
+      credential: 'muazkh'
     }
   ],
-  iceCandidatePoolSize: 10
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle' as RTCBundlePolicy,
+  rtcpMuxPolicy: 'require' as RTCRtcpMuxPolicy
 };
 
 interface VideoCallOptions {
@@ -47,9 +60,7 @@ class WebRTCCall {
   private peerConnection: RTCPeerConnection | null = null;
   localStream: MediaStream | null = null; // Made public for access from VideoCall component
   remoteStream: MediaStream | null = null; // Make remoteStream public as well
-  private isPolling: boolean = false;
-  private pollingInterval: ReturnType<typeof setInterval> | null = null;
-  private lastMessageTimestamp: string = '';
+  private socket: Socket | null = null;
   private isInitiator: boolean = false;
   private participantId: string | null = null;
   private userId: string | null = null;
@@ -82,8 +93,9 @@ class WebRTCCall {
   async initialize(): Promise<void> {
     try {
       console.log('Initializing WebRTC call...');
-      // Join the room first to get participant ID
-      await this.joinRoom();
+      
+      // Initialize Socket.IO connection
+      await this.initializeSocketConnection();
       
       // Create RTCPeerConnection first
       this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
@@ -92,16 +104,21 @@ class WebRTCCall {
       // Set up remote stream container
       this.remoteStream = new MediaStream();
       
-      // Request local media with explicit constraints
+      // Request local media with explicit constraints for better quality
       try {
         console.log('Requesting media with constraints...');
         this.localStream = await navigator.mediaDevices.getUserMedia({ 
           video: {
             width: { ideal: 1280 },
             height: { ideal: 720 },
+            frameRate: { ideal: 30 },
             facingMode: 'user'
           }, 
-          audio: true 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
         
         // Debug log tracks
@@ -114,15 +131,25 @@ class WebRTCCall {
         // Check if tracks are enabled
         videoTracks.forEach(track => {
           console.log('Video track:', track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
+          // Ensure track is enabled
+          track.enabled = true;
         });
         audioTracks.forEach(track => {
           console.log('Audio track:', track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
+          // Ensure track is enabled
+          track.enabled = true;
         });
       } catch (mediaError) {
         console.error('Failed to get video, trying audio only:', mediaError);
         // Fallback to audio only
         try {
-          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          this.localStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
           console.log('Got audio-only local media stream');
         } catch (audioError) {
           console.error('Failed to get any media stream:', audioError);
@@ -236,6 +263,8 @@ class WebRTCCall {
             // Debug log event stream tracks
             event.streams[0].getTracks().forEach(track => {
               console.log('Event stream track:', track.kind, track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
+              // Make sure the track is enabled
+              track.enabled = true;
             });
             
             this.remoteStream = event.streams[0];
@@ -269,15 +298,231 @@ class WebRTCCall {
         this.onLocalStreamCallback(this.localStream);
       }
       
-      // Start polling for signaling messages
-      this.startPolling();
+      // Join the WebRTC room using WebSockets
+      await this.joinRoom();
       
-      // Check room status to determine if we should initiate the call
-      await this.checkRoomAndInitiateIfNeeded();
+      // Wait to see if we need to initiate the call
+      // When a second participant joins, we'll get a user_joined event
+      setTimeout(() => {
+        if (!this.isConnected && this.peerConnection) {
+          console.log('No connection yet, creating offer...');
+          this.createAndSendOffer();
+        }
+      }, 2000);
       
     } catch (error) {
       console.error('Error initializing WebRTC call:', error);
       this.onErrorCallback?.(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+  }
+  
+  /**
+   * Initialize Socket.IO connection
+   */
+  private async initializeSocketConnection(): Promise<void> {
+    try {
+      // Create Socket.IO connection to the WebSocket server
+      const wsUrl = API_URL.replace(/^https?:\/\//, 'wss://').replace(/^http:\/\//, 'ws://');
+      console.log('Connecting to WebSocket server:', wsUrl);
+      
+      this.socket = io(wsUrl, {
+        transports: ['websocket'],
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+        forceNew: true
+      });
+      
+      // Wait for socket to connect
+      await new Promise<void>((resolve, reject) => {
+        if (!this.socket) {
+          reject(new Error('Socket not initialized'));
+          return;
+        }
+        
+        // Handle connection
+        this.socket.on('connect', () => {
+          console.log('WebSocket connected');
+          resolve();
+        });
+        
+        // Handle connection error
+        this.socket.on('connect_error', (error) => {
+          console.error('WebSocket connection error:', error);
+          reject(error);
+        });
+        
+        // Set a timeout in case connection takes too long
+        setTimeout(() => {
+          reject(new Error('WebSocket connection timeout'));
+        }, 10000);
+      });
+      
+      // Authenticate with the WebSocket server
+      await this.authenticateSocket();
+      
+      // Setup signal handlers
+      this.setupSignalHandlers();
+      
+    } catch (error) {
+      console.error('Failed to initialize WebSocket connection:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Authenticate with the WebSocket server
+   */
+  private async authenticateSocket(): Promise<void> {
+    try {
+      const token = localStorage.getItem('token');
+      if (!token) {
+        throw new Error('No authentication token found');
+      }
+      
+      if (!this.socket) {
+        throw new Error('Socket not initialized');
+      }
+      
+      // Send authentication message
+      return new Promise<void>((resolve, reject) => {
+        if (!this.socket) {
+          reject(new Error('Socket not initialized'));
+          return;
+        }
+        
+        this.socket.emit('authenticate', { token });
+        
+        // Listen for authentication response
+        this.socket.once('authenticated', (data) => {
+          console.log('WebSocket authenticated:', data);
+          this.userId = data.user_id;
+          resolve();
+        });
+        
+        // Handle authentication error
+        this.socket.once('auth_error', (error) => {
+          console.error('WebSocket authentication error:', error);
+          reject(new Error(error.error || 'Authentication failed'));
+        });
+        
+        // Set a timeout
+        setTimeout(() => {
+          reject(new Error('Authentication timeout'));
+        }, 5000);
+      });
+    } catch (error) {
+      console.error('Socket authentication error:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Setup WebSocket signal handlers
+   */
+  private setupSignalHandlers(): void {
+    if (!this.socket) return;
+    
+    // Handle WebRTC signaling messages
+    this.socket.on('webrtc_signal', async (data) => {
+      console.log('Received WebRTC signal:', data.signal.type);
+      
+      // Skip messages from ourselves
+      if (data.from_user_id === this.userId) return;
+      
+      try {
+        await this.handleSignalingMessage(data);
+      } catch (error) {
+        console.error('Error handling signaling message:', error);
+      }
+    });
+    
+    // Handle user joined event
+    this.socket.on('user_joined', (data) => {
+      console.log('User joined room:', data);
+      
+      // Create offer when another user joins
+      if (data.user_id !== this.userId && this.peerConnection) {
+        console.log('Creating offer for new participant');
+        this.createAndSendOffer();
+      }
+    });
+    
+    // Handle user left event
+    this.socket.on('user_left', (data) => {
+      console.log('User left room:', data);
+      if (this.isConnected) {
+        this.isConnected = false;
+        this.onPeerDisconnectedCallback?.();
+      }
+    });
+    
+    // Handle room errors
+    this.socket.on('room_error', (error) => {
+      console.error('Room error:', error);
+      this.onErrorCallback?.(new Error(error.error || 'Room error'));
+    });
+    
+    // Handle signal errors
+    this.socket.on('signal_error', (error) => {
+      console.error('Signal error:', error);
+    });
+    
+    // Handle disconnection
+    this.socket.on('disconnect', () => {
+      console.log('WebSocket disconnected');
+      
+      // Try to reconnect
+      setTimeout(() => {
+        if (this.socket) {
+          console.log('Attempting to reconnect WebSocket...');
+          this.socket.connect();
+        }
+      }, 1000);
+    });
+  }
+  
+  /**
+   * Join a WebRTC room using WebSockets
+   */
+  private async joinRoom(): Promise<void> {
+    if (!this.socket) {
+      throw new Error('Socket not initialized');
+    }
+    
+    try {
+      // Join the room
+      return new Promise<void>((resolve, reject) => {
+        if (!this.socket) {
+          reject(new Error('Socket not initialized'));
+          return;
+        }
+        
+        this.socket.emit('join_room', {
+          room_id: this.roomId
+        });
+        
+        // Listen for join response
+        this.socket.once('room_joined', (data) => {
+          console.log('Joined WebRTC room:', data);
+          resolve();
+        });
+        
+        // Handle room error
+        this.socket.once('room_error', (error) => {
+          console.error('Error joining room:', error);
+          reject(new Error(error.error || 'Failed to join room'));
+        });
+        
+        // Set a timeout
+        setTimeout(() => {
+          reject(new Error('Join room timeout'));
+        }, 5000);
+      });
+    } catch (error) {
+      console.error('Error joining WebRTC room:', error);
+      this.onErrorCallback?.(new Error('Failed to join the video call room'));
       throw error;
     }
   }
@@ -314,67 +559,6 @@ class WebRTCCall {
   }
   
   /**
-   * Join the WebRTC room
-   */
-  private async joinRoom(): Promise<void> {
-    try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        throw new Error('No authentication token found');
-      }
-      
-      const response = await axios.post(
-        `${API_URL}/api/webrtc/rooms/${this.roomId}/join`,
-        { appointment_id: this.appointmentId },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      
-      this.participantId = response.data.participant_id;
-      this.userId = response.data.user_id;
-      
-      console.log('Joined WebRTC room:', response.data);
-    } catch (error) {
-      console.error('Error joining WebRTC room:', error);
-      this.onErrorCallback?.(new Error('Failed to join the video call room'));
-      throw error;
-    }
-  }
-  
-  /**
-   * Check the room status and initiate call if we're the first participant
-   */
-  private async checkRoomAndInitiateIfNeeded(): Promise<void> {
-    try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        throw new Error('No authentication token found');
-      }
-      
-      const response = await axios.get(`${API_URL}/api/webrtc/rooms/${this.roomId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      console.log('Room status:', response.data);
-      
-      // Important change: Both sides should send offers to avoid deadlock
-      // Each side will process the received offer and send an answer
-      if (response.data.participants >= 2) {
-        console.log('Multiple participants in room, always create offer');
-        // Always create an offer when there are multiple participants
-        if (this.peerConnection) {
-          await this.createAndSendOffer();
-        }
-      } else {
-        // If we're the first, we'll wait and poll for others to join
-        this.isInitiator = true;
-        console.log('We are the first participant, will initiate call when others join');
-      }
-    } catch (error) {
-      console.error('Error checking room status:', error);
-    }
-  }
-  
-  /**
    * Create and send an offer to remote peer
    */
   private async createAndSendOffer(): Promise<void> {
@@ -397,12 +581,12 @@ class WebRTCCall {
       // Wait a bit to ensure ICE candidates are gathered
       await new Promise(resolve => setTimeout(resolve, 500));
       
-      // Send offer through signaling channel
+      // Send offer through WebSocket
       this.sendSignal({
         type: 'offer',
         sdp: this.peerConnection.localDescription
       });
-      console.log('Sent offer via signaling');
+      console.log('Sent offer via WebSocket');
       
     } catch (error) {
       console.error('Error creating offer:', error);
@@ -411,109 +595,9 @@ class WebRTCCall {
   }
   
   /**
-   * Start polling for signaling messages
-   */
-  private startPolling(): void {
-    if (this.isPolling) return;
-    
-    console.log('Starting polling for signaling messages');
-    this.isPolling = true;
-    this.pollingInterval = setInterval(() => {
-      this.pollSignalingMessages();
-    }, 1000);
-  }
-  
-  /**
-   * Stop polling for signaling messages
-   */
-  private stopPolling(): void {
-    if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
-      this.pollingInterval = null;
-    }
-    this.isPolling = false;
-    console.log('Stopped polling for signaling messages');
-  }
-  
-  /**
-   * Poll for new signaling messages
-   */
-  private async pollSignalingMessages(): Promise<void> {
-    try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        throw new Error('No authentication token found');
-      }
-      
-      // Add since parameter if we have a lastMessageTimestamp
-      let url = `${API_URL}/api/webrtc/rooms/${this.roomId}/messages`;
-      if (this.lastMessageTimestamp) {
-        url += `?since=${encodeURIComponent(this.lastMessageTimestamp)}`;
-      }
-      
-      const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      const messages: SignalingMessage[] = response.data.messages || [];
-      if (messages.length > 0) {
-        console.log(`Received ${messages.length} signaling messages`);
-      }
-      
-      // Store the server time for next polling cycle
-      if (response.data.server_time) {
-        this.lastMessageTimestamp = response.data.server_time;
-      }
-      
-      // Use a Set to track processed message IDs and avoid duplicates
-      const processedIds = new Set<string>();
-      
-      // Process each message that isn't from us and hasn't been processed yet
-      for (const message of messages) {
-        // Skip messages from ourselves
-        if (message.user_id === this.userId) continue;
-        
-        // Generate a unique ID for this message to avoid duplicates
-        const messageId = `${message.timestamp}_${message.user_id}_${message.signal?.type}`;
-        
-        // Skip if we've already processed this message
-        if (processedIds.has(messageId)) continue;
-        
-        // Process the message
-        await this.handleSignalingMessage(message);
-        
-        // Mark as processed
-        processedIds.add(messageId);
-      }
-      
-      // Make offer as initiator if needed - this handles the case where we're waiting for peers
-      if (this.isInitiator && !this.isConnected && this.peerConnection?.connectionState !== 'connecting') {
-        // Check if there are others in the room now
-        const roomResponse = await axios.get(`${API_URL}/api/webrtc/rooms/${this.roomId}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (roomResponse.data.participants >= 2 && this.peerConnection) {
-          console.log('Another participant joined, initiating call as first participant');
-          await this.createAndSendOffer();
-        }
-      }
-      
-      // If we've been connected for a while but don't have remote tracks, try to reconnect
-      if (this.isConnected && !this.hasReceivedRemoteTrack && this.peerConnection) {
-        console.log('Connected but no remote track received, trying to reconnect');
-        this.tryReconnect();
-      }
-      
-    } catch (error) {
-      console.error('Error polling signaling messages:', error);
-    }
-  }
-  
-  /**
    * Handle an incoming signaling message
    */
-  private async handleSignalingMessage(message: SignalingMessage): Promise<void> {
+  private async handleSignalingMessage(message: any): Promise<void> {
     try {
       if (!this.peerConnection) return;
       
@@ -546,7 +630,7 @@ class WebRTCCall {
           type: 'answer',
           sdp: this.peerConnection.localDescription
         });
-        console.log('Sent answer via signaling');
+        console.log('Sent answer via WebSocket');
         
       } else if (signal.type === 'answer') {
         console.log('Received answer from remote peer');
@@ -584,23 +668,21 @@ class WebRTCCall {
   }
   
   /**
-   * Send a signaling message
+   * Send a signaling message through WebSocket
    */
-  private async sendSignal(signal: any, targetUserId?: string): Promise<void> {
+  private sendSignal(signal: any, targetId?: string): void {
     try {
-      const token = localStorage.getItem('token');
-      if (!token) {
-        throw new Error('No authentication token found');
+      if (!this.socket) {
+        console.error('Cannot send signal: Socket not initialized');
+        return;
       }
       
-      await axios.post(
-        `${API_URL}/api/webrtc/rooms/${this.roomId}/signal`,
-        {
-          signal,
-          target_user_id: targetUserId
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      // Send signal to WebSocket server
+      this.socket.emit('webrtc_signal', {
+        room_id: this.roomId,
+        signal: signal,
+        target_id: targetId
+      });
       
     } catch (error) {
       console.error('Error sending signal:', error);
@@ -651,8 +733,12 @@ class WebRTCCall {
   async endCall(): Promise<void> {
     console.log('Ending WebRTC call');
     
-    // Stop polling
-    this.stopPolling();
+    // Leave the WebSocket room
+    if (this.socket) {
+      this.socket.emit('leave_room', { room_id: this.roomId });
+      this.socket.disconnect();
+      this.socket = null;
+    }
     
     // Close peer connection
     if (this.peerConnection) {

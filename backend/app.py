@@ -2,13 +2,15 @@ import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_mail import Mail
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import timedelta
 import logging
-from models import Admin
+from models import Admin, WebRTCRoom
 from routes import auth_bp, admin_bp, api_bp, doctor_bp, patient_bp, payment_bp
 import time
+import jwt
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +21,9 @@ try:
     load_dotenv()
 except Exception as e:
     logger.warning(f"Could not load .env file: {e}")
+
+# Initialize Socket.IO outside the app factory
+socketio = SocketIO(cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 def create_app():
     """Create and configure the Flask application"""
@@ -84,6 +89,9 @@ def create_app():
     app.register_blueprint(patient_bp, url_prefix='/api/patient')
     app.register_blueprint(payment_bp, url_prefix='/api/payments')
     
+    # Initialize Socket.IO with the app
+    socketio.init_app(app, cors_allowed_origins="*", async_mode='eventlet')
+    
     # Create default admin user if database is connected
     if app.config['DATABASE'] is not None:
         with app.app_context():
@@ -131,59 +139,209 @@ def create_app():
                 'error': str(e)
             }), 503
     
-    @app.route('/api/consultations/<consultation_id>', methods=['GET'])
-    def get_consultation(consultation_id):
-        try:
-            # Get token from Authorization header
-            auth_header = request.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                return jsonify({'error': 'Authorization token is required'}), 401
-            
-            token = auth_header.split(' ')[1]
-            
-            # Verify JWT token and get user info
-            try:
-                from jwt import decode
-                user_data = decode(token, app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
-                user_id = user_data.get('user_id')
-                user_role = user_data.get('role')
-            except Exception as e:
-                return jsonify({'error': 'Invalid authorization token'}), 401
-
-            # Get database instance
-            db = app.config['DATABASE']
-            if db is None:
-                return jsonify({'error': 'Database connection not available'}), 500
-            
-            # Find consultation
-            from bson import ObjectId
-            consultation = db.consultations.find_one({'_id': ObjectId(consultation_id)})
-            
-            if not consultation:
-                return jsonify({'error': 'Consultation not found'}), 404
-
-            # Check if user has access to this consultation
-            if user_role == 'doctor' and str(consultation['doctor_id']) != user_id:
-                return jsonify({'error': 'Unauthorized access'}), 403
-            elif user_role == 'patient' and str(consultation['patient_id']) != user_id:
-                return jsonify({'error': 'Unauthorized access'}), 403
-
-            # Convert ObjectId to string for JSON serialization
-            consultation['_id'] = str(consultation['_id'])
-            consultation['doctor_id'] = str(consultation['doctor_id'])
-            consultation['patient_id'] = str(consultation['patient_id'])
-            if 'appointment_id' in consultation:
-                consultation['appointment_id'] = str(consultation['appointment_id'])
-
-            return jsonify({
-                'consultation': consultation
-            })
-
-        except Exception as e:
-            logger.error(f"Error fetching consultation: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-    
     return app
+
+# WebSocket event handlers
+@socketio.on('connect')
+def handle_connect():
+    logger.info(f"Client connected: {request.sid}")
+    emit('connected', {'status': 'connected', 'sid': request.sid})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info(f"Client disconnected: {request.sid}")
+
+@socketio.on('authenticate')
+def handle_authenticate(data):
+    """Authenticate user via JWT token"""
+    try:
+        token = data.get('token')
+        if not token:
+            logger.warning(f"Authentication failed: No token provided from {request.sid}")
+            emit('auth_error', {'error': 'No token provided'})
+            return
+        
+        # Get JWT secret key from app config
+        from flask import current_app
+        jwt_secret = current_app.config['JWT_SECRET_KEY']
+        
+        # Verify token
+        user_data = jwt.decode(token, jwt_secret, algorithms=['HS256'])
+        user_id = user_data.get('user_id')
+        user_role = user_data.get('role')
+        
+        # Store user info in session
+        socketio.server.save_session(request.sid, {'user_id': user_id, 'user_role': user_role})
+        
+        logger.info(f"User authenticated: {user_id}, {user_role}")
+        emit('authenticated', {'status': 'success', 'user_id': user_id, 'user_role': user_role})
+    
+    except Exception as e:
+        logger.error(f"Authentication error: {str(e)}")
+        emit('auth_error', {'error': str(e)})
+
+@socketio.on('join_room')
+def handle_join_room(data):
+    """Join a WebRTC room"""
+    try:
+        # Get user info from session
+        user_session = socketio.server.get_session(request.sid)
+        if not user_session:
+            emit('room_error', {'error': 'Not authenticated'})
+            return
+        
+        user_id = user_session.get('user_id')
+        user_role = user_session.get('user_role')
+        room_id = data.get('room_id')
+        
+        if not room_id:
+            emit('room_error', {'error': 'Room ID is required'})
+            return
+        
+        # Join the Socket.IO room
+        join_room(room_id)
+        logger.info(f"User {user_id} joined room: {room_id}")
+        
+        # Get DB instance
+        from flask import current_app
+        db = current_app.config['DATABASE']
+        
+        # Add to WebRTC room in database
+        participant = {
+            'socket_id': request.sid,
+            'user_id': user_id,
+            'user_role': user_role,
+            'joined_at': time.time()
+        }
+        
+        # Create room if it doesn't exist
+        room = WebRTCRoom.find_by_room_id(db, room_id)
+        if not room:
+            room_data = {
+                'room_id': room_id,
+                'created_by': user_id,
+                'status': 'active',
+                'participants': [],
+                'messages': []
+            }
+            WebRTCRoom.create(db, room_data)
+        
+        # Add participant
+        WebRTCRoom.add_participant(db, room_id, participant)
+        
+        # Notify others in the room
+        emit('user_joined', {
+            'user_id': user_id,
+            'user_role': user_role
+        }, room=room_id, skip_sid=request.sid)
+        
+        # Send success to the user
+        emit('room_joined', {
+            'room_id': room_id,
+            'status': 'joined'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error joining room: {str(e)}")
+        emit('room_error', {'error': str(e)})
+
+@socketio.on('leave_room')
+def handle_leave_room(data):
+    """Leave a WebRTC room"""
+    try:
+        # Get user info from session
+        user_session = socketio.server.get_session(request.sid)
+        if not user_session:
+            return
+        
+        user_id = user_session.get('user_id')
+        room_id = data.get('room_id')
+        
+        if not room_id:
+            return
+        
+        # Leave the Socket.IO room
+        leave_room(room_id)
+        logger.info(f"User {user_id} left room: {room_id}")
+        
+        # Get DB instance
+        from flask import current_app
+        db = current_app.config['DATABASE']
+        
+        # Remove from WebRTC room in database
+        WebRTCRoom.remove_participant(db, room_id, user_id)
+        
+        # Notify others in the room
+        emit('user_left', {
+            'user_id': user_id
+        }, room=room_id)
+        
+    except Exception as e:
+        logger.error(f"Error leaving room: {str(e)}")
+
+@socketio.on('webrtc_signal')
+def handle_webrtc_signal(data):
+    """Handle WebRTC signaling messages"""
+    try:
+        # Get user info from session
+        user_session = socketio.server.get_session(request.sid)
+        if not user_session:
+            emit('signal_error', {'error': 'Not authenticated'})
+            return
+        
+        user_id = user_session.get('user_id')
+        user_role = user_session.get('user_role')
+        room_id = data.get('room_id')
+        signal = data.get('signal')
+        target_id = data.get('target_id')
+        
+        if not room_id or not signal:
+            emit('signal_error', {'error': 'Room ID and signal are required'})
+            return
+        
+        # Add to message history in database
+        from flask import current_app
+        db = current_app.config['DATABASE']
+        
+        signal_data = {
+            'user_id': user_id,
+            'user_role': user_role,
+            'timestamp': time.time(),
+            'signal': signal,
+            'target_id': target_id
+        }
+        
+        WebRTCRoom.add_message(db, room_id, signal_data)
+        
+        # Broadcast to room or target
+        if target_id:
+            # Find target's socket ID
+            room = WebRTCRoom.find_by_room_id(db, room_id)
+            if room:
+                target_socket = None
+                for participant in room.get('participants', []):
+                    if str(participant.get('user_id')) == str(target_id):
+                        target_socket = participant.get('socket_id')
+                        break
+                
+                if target_socket:
+                    emit('webrtc_signal', {
+                        'from_user_id': user_id,
+                        'from_user_role': user_role,
+                        'signal': signal
+                    }, room=target_socket)
+                    return
+        
+        # Broadcast to all in room if no target or target not found
+        emit('webrtc_signal', {
+            'from_user_id': user_id,
+            'from_user_role': user_role,
+            'signal': signal
+        }, room=room_id, skip_sid=request.sid)
+        
+    except Exception as e:
+        logger.error(f"Error handling WebRTC signal: {str(e)}")
+        emit('signal_error', {'error': str(e)})
 
 def create_default_admin(db):
     """Create default admin user if it doesn't exist"""
@@ -226,5 +384,5 @@ if __name__ == '__main__':
     
     logger.info(f"Starting Flask application on {host}:{port}")
     
-    # Disable automatic .env loading to avoid encoding issues
-    app.run(host=host, port=port, debug=debug) 
+    # Run with socketio instead of app.run
+    socketio.run(app, host=host, port=port, debug=debug) 

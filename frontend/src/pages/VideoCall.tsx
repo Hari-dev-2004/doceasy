@@ -413,18 +413,6 @@ const VideoCall = () => {
         }
       });
       
-      // Make remoteStream accessible to the component
-      webrtc.remoteStream = null;
-      Object.defineProperty(webrtc, 'remoteStream', {
-        get: function() {
-          // This property allows the VideoCall component to access the remote stream
-          if (remoteVideoRef.current) {
-            return remoteVideoRef.current.srcObject;
-          }
-          return null;
-        }
-      });
-      
       // Store in ref for later access
       webrtcRef.current = webrtc;
       

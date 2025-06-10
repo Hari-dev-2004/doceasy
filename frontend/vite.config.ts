@@ -10,7 +10,7 @@ export default defineConfig(({ mode }) => ({
     port: 8080,
     proxy: {
       '/api': {
-        target: 'http://localhost:5000',
+        target: 'https://doceasy-bcd3.onrender.com',
         changeOrigin: true
       }
     }
@@ -29,7 +29,7 @@ export default defineConfig(({ mode }) => ({
     // Provide fallback values for production environment variables
     'import.meta.env.VITE_API_URL': JSON.stringify(
       mode === 'production' 
-        ? 'https://doceasy-1.onrender.com'
+        ? 'https://doceasy-bcd3.onrender.com'
         : 'http://localhost:5000'
     ),
   }

@@ -131,128 +131,114 @@ const VideoCall = () => {
     };
   }, [callActive, callStartTime]);
 
+  // Improved effect for handling local video streams
   useEffect(() => {
     // When either video ref or webrtc changes, check if we need to set src object
     if (localVideoRef.current && webrtcRef.current?.localStream) {
       console.log("Setting local video source object");
+      
+      // Ensure video tracks are enabled
+      const videoTracks = webrtcRef.current.localStream.getVideoTracks();
+      videoTracks.forEach(track => {
+        track.enabled = videoEnabled;
+        console.log(`Setting local video track ${track.id} enabled: ${track.enabled}`);
+      });
+      
+      // Set stream to video element
       localVideoRef.current.srcObject = webrtcRef.current.localStream;
       
       // Force play for mobile browsers
       localVideoRef.current.play().catch(err => {
         console.warn("Local video autoplay failed:", err);
+        // Add a play button for mobile browsers
+        const unlockVideo = () => {
+          localVideoRef.current?.play();
+        };
+        document.addEventListener('click', unlockVideo, { once: true });
       });
     }
-  }, [localVideoRef.current, webrtcRef.current?.localStream]);
+  }, [localVideoRef.current, webrtcRef.current?.localStream, videoEnabled]);
   
-  // Add a specific effect for handling remote video
+  // Improved effect for handling remote video streams
   useEffect(() => {
-    if (remoteVideoRef.current && hasRemoteVideo) {
-      console.log("Checking remote video source object");
+    if (remoteVideoRef.current && webrtcRef.current) {
+      console.log("Checking remote video stream");
       
-      // If remote video element doesn't have srcObject set, try to force it
-      if (!remoteVideoRef.current.srcObject && webrtcRef.current) {
+      // If we have a remote stream in the WebRTC object and it's not set on the video element
+      if (webrtcRef.current.remoteStream && 
+          (!remoteVideoRef.current.srcObject || 
+           remoteVideoRef.current.srcObject !== webrtcRef.current.remoteStream)) {
+        
+        console.log("Setting remote video source object");
+        remoteVideoRef.current.srcObject = webrtcRef.current.remoteStream;
+        
+        // Check if the remote stream has video tracks
+        const hasVideoTracks = webrtcRef.current.remoteStream.getVideoTracks().length > 0;
+        setHasRemoteVideo(hasVideoTracks);
+        
+        console.log(`Remote stream has ${webrtcRef.current.remoteStream.getVideoTracks().length} video tracks, ${webrtcRef.current.remoteStream.getAudioTracks().length} audio tracks`);
+        
         // Force play for mobile browsers
         remoteVideoRef.current.play().catch(err => {
           console.warn("Remote video autoplay failed:", err);
-          // Try again with user interaction
+          // Add a play button for mobile browsers
           const unlockVideo = () => {
             remoteVideoRef.current?.play();
-            document.body.removeEventListener('click', unlockVideo);
-            document.body.removeEventListener('touchstart', unlockVideo);
           };
-          
-          document.body.addEventListener('click', unlockVideo);
-          document.body.addEventListener('touchstart', unlockVideo);
+          document.addEventListener('click', unlockVideo, { once: true });
         });
       }
     }
-  }, [remoteVideoRef.current, hasRemoteVideo]);
+  }, [remoteVideoRef.current, webrtcRef.current?.remoteStream]);
 
-  // Check and fix video display periodically
+  // Periodic check for media connection issues
   useEffect(() => {
-    // Periodically check if video is actually displaying content
-    const checkVideoInterval = setInterval(() => {
-      const checkAndFixVideoDisplay = () => {
-        // Check local video
-        if (localVideoRef.current && webrtcRef.current?.localStream) {
-          if (!localVideoRef.current.srcObject) {
-            console.log("Fixing missing local video source");
-            localVideoRef.current.srcObject = webrtcRef.current.localStream;
-            localVideoRef.current.play().catch(e => console.warn("Local autoplay failed:", e));
-          }
+    if (!callActive) return;
+    
+    const checkMediaInterval = setInterval(() => {
+      if (webrtcRef.current && webrtcRef.current.remoteStream) {
+        // Check if remote stream has tracks
+        const videoTracks = webrtcRef.current.remoteStream.getVideoTracks();
+        const audioTracks = webrtcRef.current.remoteStream.getAudioTracks();
+        
+        console.log(`Remote stream check: ${videoTracks.length} video tracks, ${audioTracks.length} audio tracks`);
+        
+        // Update UI based on track presence
+        setHasRemoteVideo(videoTracks.length > 0);
+        
+        // Check if tracks are enabled
+        const hasEnabledVideo = videoTracks.some(track => track.enabled);
+        const hasEnabledAudio = audioTracks.some(track => track.enabled);
+        
+        console.log(`Remote track state: video enabled: ${hasEnabledVideo}, audio enabled: ${hasEnabledAudio}`);
+        
+        // If we should have video but don't have enabled tracks, try to reconnect
+        if (videoTracks.length > 0 && !hasEnabledVideo && reconnectAttempts < 2) {
+          console.log("Remote video track exists but is not enabled, attempting reconnect");
+          handleReconnect();
         }
+      }
+    }, 5000);
+    
+    return () => clearInterval(checkMediaInterval);
+  }, [callActive, reconnectAttempts]);
 
-        // Check remote video 
-        if (remoteVideoRef.current && hasRemoteVideo && !remoteVideoRef.current.srcObject) {
-          console.log("Attempting to fix remote video display");
-          
-          // If WebRTC object has access to remote stream
-          if (webrtcRef.current && webrtcRef.current.remoteStream) {
-            console.log("Setting remote stream from WebRTC object");
-            remoteVideoRef.current.srcObject = webrtcRef.current.remoteStream;
-            remoteVideoRef.current.play().catch(e => console.warn("Remote autoplay failed:", e));
-          }
-          
-          // If the call appears connected but no video, try restarting
-          if (connectionStatus === 'Connected' && !hasRemoteVideo && webrtcRef.current) {
-            console.log("Connection appears established but no remote video, trying to restart");
-            setReconnectAttempts(prev => {
-              if (prev < 3) {  // Limit number of auto-restarts
-                startCall();
-                return prev + 1;
-              }
-              return prev;
-            });
-          }
-        }
-      };
-      
-      checkAndFixVideoDisplay();
-    }, 5000);  // Check every 5 seconds
-    
-    return () => clearInterval(checkVideoInterval);
-  }, [hasRemoteVideo, connectionStatus]);
-
-  // Handle video element events
-  useEffect(() => {
-    const handleLoadedMetadata = () => {
-      console.log("Video loaded metadata");
-    };
-    
-    const handlePlaying = () => {
-      console.log("Video is playing");
-      if (remoteVideoRef.current === document.activeElement) {
-        setHasRemoteVideo(true);
-      }
-      if (localVideoRef.current === document.activeElement) {
-        setHasLocalVideo(true);
-      }
-    };
-    
-    // Set up event listeners
-    if (localVideoRef.current) {
-      localVideoRef.current.onloadedmetadata = handleLoadedMetadata;
-      localVideoRef.current.onplaying = handlePlaying;
+  // Improved video element callback handlers
+  const handleLoadedMetadata = (isLocal: boolean) => {
+    console.log(`${isLocal ? 'Local' : 'Remote'} video metadata loaded`);
+    if (isLocal && localVideoRef.current) {
+      localVideoRef.current.play().catch(e => console.warn("Local video play failed:", e));
+    } else if (!isLocal && remoteVideoRef.current) {
+      remoteVideoRef.current.play().catch(e => console.warn("Remote video play failed:", e));
     }
-    
-    if (remoteVideoRef.current) {
-      remoteVideoRef.current.onloadedmetadata = handleLoadedMetadata;
-      remoteVideoRef.current.onplaying = handlePlaying;
+  };
+  
+  const handlePlaying = (isLocal: boolean) => {
+    console.log(`${isLocal ? 'Local' : 'Remote'} video playing`);
+    if (!isLocal) {
+      setHasRemoteVideo(true);
     }
-    
-    return () => {
-      // Remove event listeners
-      if (localVideoRef.current) {
-        localVideoRef.current.onloadedmetadata = null;
-        localVideoRef.current.onplaying = null;
-      }
-      
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.onloadedmetadata = null;
-        remoteVideoRef.current.onplaying = null;
-      }
-    };
-  }, [callActive]);
+  };
 
   const fetchConsultationData = async (user: any) => {
     if (!appointmentId) return;
@@ -344,14 +330,21 @@ const VideoCall = () => {
                      stream.getVideoTracks().length, "video,", 
                      stream.getAudioTracks().length, "audio");
           
+          // Ensure video tracks are properly enabled
+          stream.getVideoTracks().forEach(track => {
+            track.enabled = videoEnabled;
+            console.log(`Local video track ${track.id} enabled: ${track.enabled}`);
+          });
+          
+          // Ensure audio tracks are properly enabled
+          stream.getAudioTracks().forEach(track => {
+            track.enabled = audioEnabled;
+            console.log(`Local audio track ${track.id} enabled: ${track.enabled}`);
+          });
+          
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
-            setHasLocalVideo(true);
-            
-            // Ensure video tracks are properly enabled
-            stream.getVideoTracks().forEach(track => {
-              track.enabled = videoEnabled;
-            });
+            setHasLocalVideo(stream.getVideoTracks().length > 0);
             
             // Force play on mobile devices
             localVideoRef.current.play().catch(e => {
@@ -364,6 +357,11 @@ const VideoCall = () => {
           console.log("Got remote stream with tracks:", 
                      stream.getVideoTracks().length, "video,", 
                      stream.getAudioTracks().length, "audio");
+          
+          // Log each track to help debug
+          stream.getTracks().forEach(track => {
+            console.log(`Remote track: ${track.kind}, id: ${track.id}, enabled: ${track.enabled}, readyState: ${track.readyState}`);
+          });
           
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = stream;
@@ -473,6 +471,15 @@ const VideoCall = () => {
     
     if (webrtcRef.current) {
       webrtcRef.current.toggleVideo(newVideoState);
+      
+      // Double-check that tracks are actually enabled/disabled
+      if (webrtcRef.current.localStream) {
+        const videoTracks = webrtcRef.current.localStream.getVideoTracks();
+        videoTracks.forEach(track => {
+          track.enabled = newVideoState;
+          console.log(`Set video track ${track.id} enabled to ${track.enabled}`);
+        });
+      }
     }
     
     toast({
@@ -487,6 +494,15 @@ const VideoCall = () => {
     
     if (webrtcRef.current) {
       webrtcRef.current.toggleAudio(newAudioState);
+      
+      // Double-check that tracks are actually enabled/disabled
+      if (webrtcRef.current.localStream) {
+        const audioTracks = webrtcRef.current.localStream.getAudioTracks();
+        audioTracks.forEach(track => {
+          track.enabled = newAudioState;
+          console.log(`Set audio track ${track.id} enabled to ${track.enabled}`);
+        });
+      }
     }
     
     toast({
@@ -675,9 +691,11 @@ const VideoCall = () => {
 
                       <video
                         ref={remoteVideoRef}
-                        className="w-full h-full object-contain rounded-lg"
+                        className="h-full w-full object-cover rounded-lg"
                         autoPlay
                         playsInline
+                        onLoadedMetadata={() => handleLoadedMetadata(false)}
+                        onPlaying={() => handlePlaying(false)}
                       ></video>
                       
                       <div className="absolute bottom-4 left-4 flex items-center bg-black/50 px-3 py-1 rounded-full">
@@ -734,10 +752,12 @@ const VideoCall = () => {
                 {videoEnabled && hasLocalVideo ? (
                   <video
                     ref={localVideoRef}
-                    className="w-full h-full object-contain"
+                    className="h-full w-full object-cover rounded-lg"
                     autoPlay
                     playsInline
-                    muted // Mute local video to prevent feedback
+                    muted
+                    onLoadedMetadata={() => handleLoadedMetadata(true)}
+                    onPlaying={() => handlePlaying(true)}
                   ></video>
                 ) : (
                   <div className="absolute inset-0 flex items-center justify-center">

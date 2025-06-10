@@ -2,7 +2,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import Index from "./pages/Index";
 import PatientLogin from "./pages/login/Patient";
 import DoctorLogin from "./pages/login/Doctor";
@@ -61,6 +61,9 @@ const App = () => (
           <Route path="/checkout" element={<CheckoutPage />} />
           <Route path="/video-call/:appointmentId" element={<VideoCall />} />
           <Route path="/feedback/:id" element={<Feedback />} />
+          
+          {/* Redirect routes */}
+          <Route path="/appointments" element={<Navigate to="/" replace />} />
           
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />

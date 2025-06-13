@@ -329,15 +329,20 @@ class WebRTCCall {
   private async initializeSocketConnection(): Promise<void> {
     try {
       // Create Socket.IO connection to the WebSocket server
-      const wsUrl = API_URL.replace(/^https?:\/\//, 'wss://').replace(/^http:\/\//, 'ws://');
-      console.log('Connecting to WebSocket server:', wsUrl);
+      // FIXED: Use correct WebSocket URL format and path
+      const apiUrl = API_URL;
+      const wsUrl = apiUrl.replace(/^https?:\/\//, '');
+      const socketUrl = apiUrl.includes('localhost') ? `ws://${wsUrl}` : `wss://${wsUrl}`;
       
-      this.socket = io(wsUrl, {
+      console.log('Connecting to WebSocket server:', socketUrl);
+      
+      this.socket = io(socketUrl, {
         transports: ['websocket'],
         reconnection: true,
         reconnectionAttempts: 5,
         reconnectionDelay: 1000,
-        forceNew: true
+        forceNew: true,
+        path: '/socket.io' // Explicitly set the Socket.IO path
       });
       
       // Wait for socket to connect
@@ -505,8 +510,12 @@ class WebRTCCall {
           return;
         }
         
+        // FIXED: Add better error handling and logging for room joining
+        console.log(`Attempting to join room: ${this.roomId}`);
+        
         this.socket.emit('join_room', {
-          room_id: this.roomId
+          room_id: this.roomId,
+          appointment_id: this.appointmentId
         });
         
         // Listen for join response
@@ -524,7 +533,7 @@ class WebRTCCall {
         // Set a timeout
         setTimeout(() => {
           reject(new Error('Join room timeout'));
-        }, 5000);
+        }, 10000); // Increased timeout for slower connections
       });
     } catch (error) {
       console.error('Error joining WebRTC room:', error);
@@ -624,6 +633,7 @@ class WebRTCCall {
       const signal = message.signal;
       console.log('Handling signal type:', signal.type);
       
+      // FIXED: Handle signaling with better error handling and state management
       if (signal.type === 'offer') {
         console.log('Received offer from remote peer');
         
@@ -631,53 +641,68 @@ class WebRTCCall {
         const signalingState = this.peerConnection.signalingState;
         console.log('Current signaling state before processing offer:', signalingState);
         
-        // If we're not in stable state, reset the connection
-        if (signalingState !== 'stable') {
-          console.log('Resetting connection before processing offer...');
-          await this.peerConnection.setLocalDescription({type: 'rollback'} as RTCSessionDescriptionInit);
+        try {
+          // If we're not in stable state, reset the connection
+          if (signalingState !== 'stable') {
+            console.log('Resetting connection before processing offer...');
+            await this.peerConnection.setLocalDescription({type: 'rollback'} as RTCSessionDescriptionInit);
+          }
+          
+          // Set remote description from offer
+          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          console.log('Set remote description from offer');
+          
+          // Create and send answer
+          const answer = await this.peerConnection.createAnswer();
+          await this.peerConnection.setLocalDescription(answer);
+          console.log('Created and set local description from answer');
+          
+          this.sendSignal({
+            type: 'answer',
+            sdp: this.peerConnection.localDescription
+          });
+          console.log('Sent answer via WebSocket');
+        } catch (e) {
+          console.error('Error handling offer:', e);
+          // Try to recover by restarting ICE
+          this.tryReconnect();
         }
-        
-        // Set remote description from offer
-        await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        console.log('Set remote description from offer');
-        
-        // Create and send answer
-        const answer = await this.peerConnection.createAnswer();
-        await this.peerConnection.setLocalDescription(answer);
-        console.log('Created and set local description from answer');
-        
-        this.sendSignal({
-          type: 'answer',
-          sdp: this.peerConnection.localDescription
-        });
-        console.log('Sent answer via WebSocket');
         
       } else if (signal.type === 'answer') {
         console.log('Received answer from remote peer');
         
-        // Check if we can set the remote description in current state
-        const signalingState = this.peerConnection.signalingState;
-        console.log('Current signaling state before processing answer:', signalingState);
-        
-        // Only process answer if we're in have-local-offer state
-        if (signalingState === 'have-local-offer') {
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-          console.log('Set remote description from answer');
-        } else {
-          console.log('Ignoring answer - peer connection not in have-local-offer state');
+        try {
+          // Check if we can set the remote description in current state
+          const signalingState = this.peerConnection.signalingState;
+          console.log('Current signaling state before processing answer:', signalingState);
+          
+          // Only process answer if we're in have-local-offer state
+          if (signalingState === 'have-local-offer') {
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+            console.log('Set remote description from answer');
+          } else {
+            console.log('Ignoring answer - peer connection not in have-local-offer state');
+          }
+        } catch (e) {
+          console.error('Error handling answer:', e);
+          this.tryReconnect();
         }
         
       } else if (signal.type === 'candidate') {
         console.log('Received ICE candidate from remote peer');
         
-        // Only add ice candidate if remote description has been set
-        if (this.peerConnection.remoteDescription) {
-          if (signal.candidate) {
-            await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
-            console.log('Added ICE candidate');
+        try {
+          // Only add ice candidate if remote description has been set
+          if (this.peerConnection.remoteDescription) {
+            if (signal.candidate) {
+              await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
+              console.log('Added ICE candidate');
+            }
+          } else {
+            console.log('Ignoring ICE candidate - no remote description set yet');
           }
-        } else {
-          console.log('Ignoring ICE candidate - no remote description set yet');
+        } catch (e) {
+          console.error('Error handling ICE candidate:', e);
         }
       } else {
         console.warn('Unknown signal type:', signal.type);

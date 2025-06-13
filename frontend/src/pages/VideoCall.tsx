@@ -54,17 +54,38 @@ const VideoCall: React.FC = () => {
         setLoading(true);
         
         // Get consultation data
-      const token = localStorage.getItem('token');
-      const response = await axios.get(`${API_URL}/api/consultations/join/${appointmentId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-        const consultationData = response.data;
+        const token = localStorage.getItem('token');
+        // FIXED: Add error handling and retry logic for consultation fetching
+        let attempts = 0;
+        const maxAttempts = 3;
+        let consultationData = null;
         
-        if (consultationData && consultationData.room_id) {
+        while (attempts < maxAttempts && !consultationData) {
+          try {
+            attempts++;
+            console.log(`Fetching consultation data, attempt ${attempts}/${maxAttempts}`);
+            
+            const response = await axios.get(`${API_URL}/api/consultations/join/${appointmentId}`, {
+              headers: { Authorization: `Bearer ${token}` }
+            });
+            
+            consultationData = response.data;
+          } catch (err: any) {
+            console.error(`Attempt ${attempts} failed:`, err);
+            
+            if (attempts >= maxAttempts) {
+              throw err;
+            }
+            
+            // Wait before retrying
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+        
+        if (consultationData && consultationData.video_call_id) {
           setConsultation(consultationData);
-        // Simplified security verification - if we can fetch the appointment, user is authorized
-        setSecurityVerified(true);
+          // Simplified security verification - if we can fetch the appointment, user is authorized
+          setSecurityVerified(true);
 
           // Set remote user name based on current user role
           const userRole = localStorage.getItem('userRole');
@@ -73,33 +94,33 @@ const VideoCall: React.FC = () => {
           } else {
             setRemoteUserName(consultationData.doctor_name || 'Doctor');
           }
-      } else {
-        toast({
+        } else {
+          toast({
             title: "Invalid consultation",
             description: "Cannot start video call with this appointment",
-          variant: "destructive"
-        });
+            variant: "destructive"
+          });
           navigate('/');
-      }
-    } catch (error: any) {
-      console.error('Error fetching consultation:', error);
-      toast({
+        }
+      } catch (error: any) {
+        console.error('Error fetching consultation:', error);
+        toast({
           title: "Error fetching consultation",
           description: error.response?.data?.error || "Failed to load consultation details",
-        variant: "destructive"
-      });
+          variant: "destructive"
+        });
         navigate('/');
-    } finally {
-      setLoading(false);
-    }
-  };
+      } finally {
+        setLoading(false);
+      }
+    };
 
     fetchConsultation();
   }, [appointmentId, navigate, toast]);
   
   // Initialize WebRTC when consultation is loaded
   useEffect(() => {
-    if (!securityVerified || !consultation?.room_id) return;
+    if (!securityVerified || !consultation?.video_call_id) return;
     
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
@@ -109,10 +130,14 @@ const VideoCall: React.FC = () => {
       try {
         console.log(`Initializing WebRTC call (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts + 1})`);
         setLastConnectAttempt(new Date());
+        
+        // FIXED: Use video_call_id instead of room_id for consistency
+        const roomId = consultation.video_call_id;
+        console.log(`Using room ID: ${roomId} for WebRTC connection`);
       
         // Create WebRTC call instance
         const webrtcCall = new WebRTCCall({
-          roomId: consultation.room_id,
+          roomId: roomId,
           appointmentId: appointmentId || '',
           onLocalStream: (stream) => {
             console.log('Got local stream in component');

@@ -329,56 +329,69 @@ class WebRTCCall {
   private async initializeSocketConnection(): Promise<void> {
     try {
       // Create Socket.IO connection to the WebSocket server
-      // FIXED: Use correct WebSocket URL format and path
+      // Use your deployed backend URL
       const apiUrl = API_URL;
-      const wsUrl = apiUrl.replace(/^https?:\/\//, '');
-      const socketUrl = apiUrl.includes('localhost') ? `ws://${wsUrl}` : `wss://${wsUrl}`;
       
-      console.log('Connecting to WebSocket server:', socketUrl);
+      // For better compatibility with Render.com and other hosting providers
+      console.log('Connecting to WebSocket server:', apiUrl);
       
-      this.socket = io(socketUrl, {
-        transports: ['websocket'],
+      // FIXED: Use both websocket and polling transports for better reliability
+      this.socket = io(apiUrl, {
+        transports: ['websocket', 'polling'],  // Allow fallback to long polling if websocket fails
         reconnection: true,
         reconnectionAttempts: 5,
         reconnectionDelay: 1000,
         forceNew: true,
-        path: '/socket.io' // Explicitly set the Socket.IO path
+        timeout: 20000,  // Increased timeout for slow connections
       });
       
-      // Wait for socket to connect
+      // Wait for socket to connect with better error handling
       await new Promise<void>((resolve, reject) => {
         if (!this.socket) {
           reject(new Error('Socket not initialized'));
           return;
         }
         
+        // Set a timeout first to ensure we don't wait forever
+        const timeoutId = setTimeout(() => {
+          console.error('WebSocket connection timeout - using HTTP fallback');
+          // Instead of rejecting, we'll continue and use HTTP fallbacks
+          resolve();
+        }, 10000);
+        
         // Handle connection
         this.socket.on('connect', () => {
-          console.log('WebSocket connected');
+          console.log('WebSocket connected successfully');
+          clearTimeout(timeoutId);  // Clear the timeout since we connected
           resolve();
         });
         
         // Handle connection error
         this.socket.on('connect_error', (error) => {
           console.error('WebSocket connection error:', error);
-          reject(error);
+          // Don't reject, let the timeout handle it
+          // We'll continue and use HTTP fallbacks if needed
         });
-        
-        // Set a timeout in case connection takes too long
-        setTimeout(() => {
-          reject(new Error('WebSocket connection timeout'));
-        }, 10000);
       });
       
       // Authenticate with the WebSocket server
-      await this.authenticateSocket();
-      
-      // Setup signal handlers
-      this.setupSignalHandlers();
-      
+      // Only if we actually have a socket connection
+      if (this.socket.connected) {
+        await this.authenticateSocket();
+        
+        // Setup signal handlers
+        this.setupSignalHandlers();
+      } else {
+        console.warn('WebSocket not connected - will use HTTP fallback for signaling');
+        // We'll implement HTTP-based signaling as a fallback
+        this._setupHttpSignalingFallback();
+      }
     } catch (error) {
       console.error('Failed to initialize WebSocket connection:', error);
-      throw error;
+      
+      // Instead of throwing, use HTTP fallback
+      console.warn('Switching to HTTP fallback for signaling');
+      this._setupHttpSignalingFallback();
     }
   }
   
@@ -495,49 +508,89 @@ class WebRTCCall {
   }
   
   /**
-   * Join a WebRTC room using WebSockets
+   * Join a WebRTC room using WebSockets or HTTP fallback
    */
   private async joinRoom(): Promise<void> {
-    if (!this.socket) {
-      throw new Error('Socket not initialized');
-    }
-    
     try {
-      // Join the room
-      return new Promise<void>((resolve, reject) => {
-        if (!this.socket) {
-          reject(new Error('Socket not initialized'));
-          return;
-        }
+      // Check if socket is connected
+      if (this.socket && this.socket.connected) {
+        // Join using WebSockets
+        console.log(`Attempting to join room via WebSocket: ${this.roomId}`);
         
-        // FIXED: Add better error handling and logging for room joining
-        console.log(`Attempting to join room: ${this.roomId}`);
-        
-        this.socket.emit('join_room', {
-          room_id: this.roomId,
-          appointment_id: this.appointmentId
+        return new Promise<void>((resolve, reject) => {
+          if (!this.socket) {
+            // Fall back to HTTP if socket is not available
+            this._joinRoomViaHttp().then(resolve).catch(reject);
+            return;
+          }
+          
+          // FIXED: Add better error handling and logging for room joining
+          console.log(`Emitting join_room event for room: ${this.roomId}`);
+          
+          this.socket.emit('join_room', {
+            room_id: this.roomId,
+            appointment_id: this.appointmentId
+          });
+          
+          // Listen for join response
+          this.socket.once('room_joined', (data) => {
+            console.log('Joined WebRTC room via WebSocket:', data);
+            resolve();
+          });
+          
+          // Handle room error
+          this.socket.once('room_error', (error) => {
+            console.error('Error joining room via WebSocket:', error);
+            
+            // Try HTTP fallback instead of rejecting
+            console.log('Attempting HTTP fallback for room join');
+            this._joinRoomViaHttp().then(resolve).catch(reject);
+          });
+          
+          // Set a timeout - if no response, try HTTP
+          setTimeout(() => {
+            console.log('Room join via WebSocket timed out, trying HTTP fallback');
+            this._joinRoomViaHttp().then(resolve).catch(reject);
+          }, 8000); // Shorter timeout before falling back
         });
-        
-        // Listen for join response
-        this.socket.once('room_joined', (data) => {
-          console.log('Joined WebRTC room:', data);
-          resolve();
-        });
-        
-        // Handle room error
-        this.socket.once('room_error', (error) => {
-          console.error('Error joining room:', error);
-          reject(new Error(error.error || 'Failed to join room'));
-        });
-        
-        // Set a timeout
-        setTimeout(() => {
-          reject(new Error('Join room timeout'));
-        }, 10000); // Increased timeout for slower connections
-      });
+      } else {
+        // Join using HTTP fallback
+        return this._joinRoomViaHttp();
+      }
     } catch (error) {
       console.error('Error joining WebRTC room:', error);
-      this.onErrorCallback?.(new Error('Failed to join the video call room'));
+      
+      // Try HTTP fallback instead of throwing
+      try {
+        await this._joinRoomViaHttp();
+      } catch (httpError) {
+        console.error('HTTP fallback also failed:', httpError);
+        this.onErrorCallback?.(new Error('Failed to join the video call room'));
+        throw httpError;
+      }
+    }
+  }
+
+  /**
+   * Join a room using HTTP API as fallback
+   */
+  private async _joinRoomViaHttp(): Promise<void> {
+    try {
+      console.log(`Joining room via HTTP fallback: ${this.roomId}`);
+      
+      const token = localStorage.getItem('token');
+      if (!token) throw new Error('No authentication token found');
+      
+      await axios.post(
+        `${API_URL}/api/webrtc/rooms/${this.roomId}/join`, 
+        { appointment_id: this.appointmentId },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      console.log('Successfully joined room via HTTP');
+      return;
+    } catch (error) {
+      console.error('Error joining room via HTTP:', error);
       throw error;
     }
   }
@@ -717,18 +770,27 @@ class WebRTCCall {
    */
   private sendSignal(signal: any, targetId?: string): void {
     try {
-      if (!this.socket) {
-        console.error('Cannot send signal: Socket not initialized');
-        return;
+      // If socket is connected, use it
+      if (this.socket && this.socket.connected) {
+        // Send signal to WebSocket server
+        this.socket.emit('webrtc_signal', {
+          room_id: this.roomId,
+          signal: signal,
+          target_id: targetId
+        });
+        console.log('Sent signal via WebSocket:', signal.type);
+      } else {
+        // Fall back to HTTP signaling if WebSocket is not available
+        console.log('Using HTTP fallback for signal:', signal.type);
+        
+        // Add target ID if provided
+        if (targetId) {
+          signal.target_id = targetId;
+        }
+        
+        // Send using HTTP
+        this._sendHttpSignal(signal);
       }
-      
-      // Send signal to WebSocket server
-      this.socket.emit('webrtc_signal', {
-        room_id: this.roomId,
-        signal: signal,
-        target_id: targetId
-      });
-      
     } catch (error) {
       console.error('Error sending signal:', error);
     }
@@ -826,6 +888,95 @@ class WebRTCCall {
       console.error('Error leaving room:', error);
     }
   }
+  
+  /**
+   * Set up HTTP-based signaling as a fallback when WebSockets fail
+   * This allows the app to work even when WebSockets are blocked or failing
+   */
+  private _setupHttpSignalingFallback(): void {
+    console.log('Setting up HTTP signaling fallback');
+    
+    // Start polling for messages
+    this._startHttpSignalingPolling();
+  }
+  
+  /**
+   * Start polling for signaling messages using HTTP
+   */
+  private _startHttpSignalingPolling(): void {
+    // Poll for new messages every few seconds
+    const pollInterval = setInterval(async () => {
+      if (!this.isConnected) {
+        // Stop polling if we disconnect
+        clearInterval(pollInterval);
+        return;
+      }
+      
+      try {
+        // Send a keep-alive signal
+        await this._sendHttpSignal({
+          type: 'keepalive',
+          roomId: this.roomId,
+          timestamp: Date.now()
+        });
+        
+        // Poll for new messages
+        const messages = await this._pollHttpSignals();
+        
+        // Process any new messages
+        for (const message of messages) {
+          await this.handleSignalingMessage(message);
+        }
+      } catch (err) {
+        console.warn('HTTP signaling poll error:', err);
+      }
+    }, 2000);
+  }
+  
+  /**
+   * Send a signaling message using HTTP
+   */
+  private async _sendHttpSignal(signal: any): Promise<void> {
+    try {
+      const token = localStorage.getItem('token');
+      if (!token) return;
+      
+      await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/signal`, {
+        signal: signal,
+        target_id: signal.target_id
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch (err) {
+      console.error('HTTP signal send error:', err);
+    }
+  }
+  
+  /**
+   * Poll for new signaling messages using HTTP
+   */
+  private async _pollHttpSignals(): Promise<any[]> {
+    try {
+      const token = localStorage.getItem('token');
+      if (!token) return [];
+      
+      const lastPoll = this._lastPollTime || Date.now() - 5000;
+      this._lastPollTime = Date.now();
+      
+      const response = await axios.get(
+        `${API_URL}/api/webrtc/rooms/${this.roomId}/messages?since=${lastPoll}`, 
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      return response.data.messages || [];
+    } catch (err) {
+      console.error('HTTP signal poll error:', err);
+      return [];
+    }
+  }
+  
+  // Track last poll time
+  private _lastPollTime: number = 0;
 }
 
 export default WebRTCCall; 

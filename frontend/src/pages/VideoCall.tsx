@@ -17,7 +17,7 @@ const VideoCall: React.FC = () => {
   const { appointmentId } = useParams();
   const navigate = useNavigate();
   const { toast } = useToast();
-  
+
   // State
   const [loading, setLoading] = useState(true);
   const [securityVerified, setSecurityVerified] = useState(false);
@@ -30,13 +30,13 @@ const VideoCall: React.FC = () => {
   const [lastConnectAttempt, setLastConnectAttempt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [remoteUserName, setRemoteUserName] = useState<string>('');
-  
+
   // WebRTC
   const webrtcRef = useRef<WebRTCCall | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  
+
   // Load user data and fetch consultation in one effect
   useEffect(() => {
     const fetchConsultation = async () => {
@@ -46,7 +46,7 @@ const VideoCall: React.FC = () => {
           description: "Cannot start video call without appointment ID",
           variant: "destructive"
         });
-        navigate('/appointments');
+        navigate('/');
         return;
       }
       
@@ -54,17 +54,17 @@ const VideoCall: React.FC = () => {
         setLoading(true);
         
         // Get consultation data
-        const token = localStorage.getItem('token');
-        const response = await axios.get(`${API_URL}/api/consultations/join/${appointmentId}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
+      const token = localStorage.getItem('token');
+      const response = await axios.get(`${API_URL}/api/consultations/join/${appointmentId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
         const consultationData = response.data;
         
         if (consultationData && consultationData.room_id) {
           setConsultation(consultationData);
-          // Simplified security verification - if we can fetch the appointment, user is authorized
-          setSecurityVerified(true);
+        // Simplified security verification - if we can fetch the appointment, user is authorized
+        setSecurityVerified(true);
 
           // Set remote user name based on current user role
           const userRole = localStorage.getItem('userRole');
@@ -73,27 +73,27 @@ const VideoCall: React.FC = () => {
           } else {
             setRemoteUserName(consultationData.doctor_name || 'Doctor');
           }
-        } else {
-          toast({
+      } else {
+        toast({
             title: "Invalid consultation",
             description: "Cannot start video call with this appointment",
-            variant: "destructive"
-          });
-          navigate('/appointments');
-        }
-      } catch (error: any) {
-        console.error('Error fetching consultation:', error);
-        toast({
-          title: "Error fetching consultation",
-          description: error.response?.data?.error || "Failed to load consultation details",
           variant: "destructive"
         });
-        navigate('/appointments');
-      } finally {
-        setLoading(false);
+          navigate('/');
       }
-    };
-    
+    } catch (error: any) {
+      console.error('Error fetching consultation:', error);
+      toast({
+          title: "Error fetching consultation",
+          description: error.response?.data?.error || "Failed to load consultation details",
+        variant: "destructive"
+      });
+        navigate('/');
+    } finally {
+      setLoading(false);
+    }
+  };
+
     fetchConsultation();
   }, [appointmentId, navigate, toast]);
   
@@ -101,109 +101,163 @@ const VideoCall: React.FC = () => {
   useEffect(() => {
     if (!securityVerified || !consultation?.room_id) return;
     
-    // Create WebRTC call instance
-    const webrtcCall = new WebRTCCall({
-      roomId: consultation.room_id,
-      appointmentId: appointmentId || '',
-      onLocalStream: (stream) => {
-        console.log('Got local stream in component');
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-          
-          // Enable autoplay for mobile devices
-          localVideoRef.current.onloadedmetadata = () => {
-            console.log('Local video metadata loaded');
-            localVideoRef.current?.play().catch(e => {
-              console.error('Error auto-playing local video:', e);
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 3;
+    
+    const initializeWebRTC = async () => {
+      try {
+        console.log(`Initializing WebRTC call (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts + 1})`);
+        setLastConnectAttempt(new Date());
+      
+        // Create WebRTC call instance
+        const webrtcCall = new WebRTCCall({
+          roomId: consultation.room_id,
+          appointmentId: appointmentId || '',
+          onLocalStream: (stream) => {
+            console.log('Got local stream in component');
+            if (localVideoRef.current) {
+              localVideoRef.current.srcObject = stream;
+              
+              // Enable autoplay for mobile devices
+              localVideoRef.current.onloadedmetadata = () => {
+                console.log('Local video metadata loaded');
+                localVideoRef.current?.play().catch(e => {
+                  console.error('Error auto-playing local video:', e);
+                });
+              };
+            }
+          },
+          onRemoteStream: (stream) => {
+            console.log('Got remote stream in component');
+            if (remoteVideoRef.current) {
+              // Store remote stream in video element
+              remoteVideoRef.current.srcObject = stream;
+              
+              // FIXED: Clear error state when we get a stream
+              setError(null);
+              
+              // Set event handlers to handle autoplay issues
+              remoteVideoRef.current.onloadedmetadata = () => {
+                console.log('Remote video metadata loaded');
+                // Try to auto-play when loaded (needed for mobile browsers)
+                remoteVideoRef.current?.play().catch(e => {
+                  console.error('Error auto-playing remote video:', e);
+                  // If autoplay fails, show a play button or message
+                  setError('Tap the video to enable playback');
+                });
+              };
+              
+              // Ensure tracks are enabled
+              const videoTracks = stream.getVideoTracks();
+              const audioTracks = stream.getAudioTracks();
+              
+              // Log the tracks we received
+              console.log(`Remote stream has ${videoTracks.length} video tracks and ${audioTracks.length} audio tracks`);
+              
+              // FIXED: Ensure both video and audio tracks are properly enabled
+              videoTracks.forEach(track => {
+                console.log(`Remote video track: ${track.id}, enabled: ${track.enabled}`);
+                track.enabled = true; // Ensure video is enabled
+              });
+              
+              audioTracks.forEach(track => {
+                console.log(`Remote audio track: ${track.id}, enabled: ${track.enabled}`);
+                track.enabled = true; // Ensure audio is enabled
+              });
+              
+              // FIXED: Set hasRemoteVideo based on active track state, not just presence
+              setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(track => track.enabled));
+            }
+          },
+          onPeerConnected: () => {
+            console.log('Peer connected');
+            setCallStatus('connected');
+            // Clear reconnect attempts on successful connection
+            reconnectAttempts = 0;
+            
+            // Start timer for call duration
+            if (durationTimerRef.current) {
+              clearInterval(durationTimerRef.current);
+            }
+            durationTimerRef.current = setInterval(() => {
+              setCallDuration(prev => prev + 1);
+            }, 1000);
+          },
+          onPeerDisconnected: () => {
+            console.log('Peer disconnected');
+            setCallStatus('disconnected');
+            setHasRemoteVideo(false);
+            // Stop timer
+            if (durationTimerRef.current) {
+              clearInterval(durationTimerRef.current);
+              durationTimerRef.current = null;
+            }
+          },
+          onError: (error) => {
+            console.error('WebRTC error:', error);
+            toast({
+              title: "Video Call Error",
+              description: error.message,
+              variant: "destructive"
             });
-          };
-        }
-      },
-      onRemoteStream: (stream) => {
-        console.log('Got remote stream in component');
-        if (remoteVideoRef.current) {
-          // Store remote stream in video element
-          remoteVideoRef.current.srcObject = stream;
-          
-          // Set event handlers to handle autoplay issues
-          remoteVideoRef.current.onloadedmetadata = () => {
-            console.log('Remote video metadata loaded');
-            // Try to auto-play when loaded (needed for mobile browsers)
-            remoteVideoRef.current?.play().catch(e => {
-              console.error('Error auto-playing remote video:', e);
-              // If autoplay fails, show a play button or message
-              setError('Tap the video to enable playback');
-            });
-          };
-          
-          // Ensure tracks are enabled
-          const videoTracks = stream.getVideoTracks();
-          const audioTracks = stream.getAudioTracks();
-          
-          // Log the tracks we received
-          console.log(`Remote stream has ${videoTracks.length} video tracks and ${audioTracks.length} audio tracks`);
-          
-          videoTracks.forEach(track => {
-            console.log(`Remote video track: ${track.id}, enabled: ${track.enabled}`);
-            track.enabled = true; // Ensure video is enabled
-          });
-          
-          audioTracks.forEach(track => {
-            console.log(`Remote audio track: ${track.id}, enabled: ${track.enabled}`);
-            track.enabled = true; // Ensure audio is enabled
-          });
-          
-          setHasRemoteVideo(videoTracks.length > 0);
-        }
-      },
-      onPeerConnected: () => {
-        console.log('Peer connected');
-        setCallStatus('connected');
-        // Start timer for call duration
-        if (durationTimerRef.current) {
-          clearInterval(durationTimerRef.current);
-        }
-        durationTimerRef.current = setInterval(() => {
-          setCallDuration(prev => prev + 1);
-        }, 1000);
-      },
-      onPeerDisconnected: () => {
-        console.log('Peer disconnected');
-        setCallStatus('disconnected');
-        setHasRemoteVideo(false);
-        // Stop timer
-        if (durationTimerRef.current) {
-          clearInterval(durationTimerRef.current);
-          durationTimerRef.current = null;
-        }
-      },
-      onError: (error) => {
-        console.error('WebRTC error:', error);
-        toast({
-          title: "Video Call Error",
-          description: error.message,
-          variant: "destructive"
+            
+            // Try to reconnect on error if we haven't exceeded attempts
+            if (reconnectAttempts < maxReconnectAttempts) {
+              reconnectAttempts++;
+              setError(`Connection error. Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts})...`);
+              
+              if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+              }
+              
+              reconnectTimer = setTimeout(() => {
+                // Clean up previous instance
+                if (webrtcRef.current) {
+                  webrtcRef.current.endCall();
+                  webrtcRef.current = null;
+                }
+                
+                // Try to initialize again
+                initializeWebRTC();
+              }, 3000);
+            }
+          }
         });
+        
+        // Store reference and change status
+        webrtcRef.current = webrtcCall;
+        setCallStatus('connecting');
+        
+        // Initialize connection
+        await webrtcCall.initialize();
+        
+      } catch (error: any) {
+        console.error('Error initializing WebRTC call:', error);
+        
+        // Try to reconnect if we haven't exceeded attempts
+        if (reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          setError(`Failed to start video call. Retrying (${reconnectAttempts}/${maxReconnectAttempts})...`);
+          
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+          }
+          
+          reconnectTimer = setTimeout(initializeWebRTC, 3000);
+        } else {
+          toast({
+            title: "Failed to start video call",
+            description: error.message,
+            variant: "destructive"
+          });
+          setCallStatus('disconnected');
+        }
       }
-    });
+    };
     
-    // Store reference and change status
-    webrtcRef.current = webrtcCall;
-    setCallStatus('connecting');
-    
-    // Initialize connection
-    webrtcCall.initialize().catch(error => {
-      console.error('Error initializing WebRTC call:', error);
-      toast({
-        title: "Failed to start video call",
-        description: error.message,
-        variant: "destructive"
-      });
-      setCallStatus('disconnected');
-    });
-    
-    // Record connection attempt time
-    setLastConnectAttempt(new Date());
+    // Start the initialization process
+    initializeWebRTC();
     
     // Cleanup function
     return () => {
@@ -216,8 +270,12 @@ const VideoCall: React.FC = () => {
         clearInterval(durationTimerRef.current);
         durationTimerRef.current = null;
       }
+      
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
     };
-  }, [appointmentId, consultation, securityVerified, toast]);
+  }, [appointmentId, consultation, securityVerified, toast, navigate]);
   
   // Handle toggle video
   const toggleVideo = () => {
@@ -266,7 +324,7 @@ const VideoCall: React.FC = () => {
       description: "Video consultation has ended"
     });
     
-    navigate('/appointments');
+    navigate('/');
   };
 
   // Format call duration as MM:SS
@@ -278,18 +336,35 @@ const VideoCall: React.FC = () => {
 
   // Add manual play handler for mobile browsers that block autoplay
   const handleManualPlay = () => {
-    if (remoteVideoRef.current && remoteVideoRef.current.paused) {
-      remoteVideoRef.current.play().then(() => {
-        setError(null);
-      }).catch(e => {
-        console.error('Failed to play remote video manually:', e);
-      });
+    // FIXED: Check if we have streams before attempting to play
+    if (remoteVideoRef.current && remoteVideoRef.current.srcObject) {
+      if (remoteVideoRef.current.paused) {
+        console.log('Attempting to manually play remote video');
+        remoteVideoRef.current.play().then(() => {
+          setError(null);
+          
+          // FIXED: Check for active video tracks when manual play succeeds
+          const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
+          if (stream) {
+            const videoTracks = stream.getVideoTracks();
+            setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(t => t.enabled));
+          }
+        }).catch(e => {
+          console.error('Failed to play remote video manually:', e);
+          setError('Video playback was blocked by your browser. Please check your permissions.');
+        });
+      }
+    } else {
+      console.log('Remote video element or stream not available for manual play');
     }
     
-    if (localVideoRef.current && localVideoRef.current.paused) {
-      localVideoRef.current.play().catch(e => {
-        console.error('Failed to play local video manually:', e);
-      });
+    if (localVideoRef.current && localVideoRef.current.srcObject) {
+      if (localVideoRef.current.paused) {
+        console.log('Attempting to manually play local video');
+        localVideoRef.current.play().catch(e => {
+          console.error('Failed to play local video manually:', e);
+        });
+      }
     }
   };
   
@@ -339,18 +414,18 @@ const VideoCall: React.FC = () => {
       });
     }
   };
-  
+
   if (loading) {
     return (
       <div className="w-full h-screen flex items-center justify-center">
-        <div className="text-center">
+          <div className="text-center">
           <h2 className="text-2xl font-bold mb-4">Starting video call...</h2>
           <p>Preparing your consultation</p>
         </div>
       </div>
     );
   }
-  
+
   return (
     <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
       {/* Main video area */}
@@ -384,13 +459,13 @@ const VideoCall: React.FC = () => {
               <div className="text-center space-y-4">
                 <h2 className="text-2xl font-bold">Call Ended</h2>
                 <p>{remoteUserName} has left the consultation</p>
-                <Button 
-                  variant="outline" 
+              <Button 
+                variant="outline" 
                   className="mt-4"
-                  onClick={() => navigate('/appointments')}
-                >
-                  Return to Appointments
-                </Button>
+                  onClick={() => navigate('/')}
+              >
+                  Return to Home
+              </Button>
               </div>
             </div>
           )}
@@ -445,32 +520,32 @@ const VideoCall: React.FC = () => {
                   <Badge variant="default" className="bg-green-600">Live</Badge>
                 </div>
               )}
-            </div>
-            
+        </div>
+
             <div className="flex space-x-2">
-              <Button
+                    <Button 
                 variant={videoEnabled ? "default" : "destructive"}
-                size="icon"
-                onClick={toggleVideo}
-              >
+                        size="icon" 
+                        onClick={toggleVideo}
+                      >
                 {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
-              </Button>
+                      </Button>
               
-              <Button
+                      <Button 
                 variant={audioEnabled ? "default" : "destructive"}
-                size="icon"
-                onClick={toggleAudio}
-              >
+                        size="icon" 
+                        onClick={toggleAudio}
+                      >
                 {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
-              </Button>
+                      </Button>
               
-              <Button
+                      <Button 
                 variant="destructive"
-                size="icon"
-                onClick={endCall}
-              >
+                        size="icon" 
+                        onClick={endCall}
+                      >
                 <PhoneOff className="h-4 w-4" />
-              </Button>
+                      </Button>
             </div>
           </div>
         </Card>

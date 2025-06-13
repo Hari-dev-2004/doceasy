@@ -97,11 +97,7 @@ class WebRTCCall {
       // Initialize Socket.IO connection
       await this.initializeSocketConnection();
       
-      // Create RTCPeerConnection first
-      this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
-      console.log('Created peer connection with config:', PEER_CONFIG);
-      
-      // Set up remote stream container
+      // FIXED: Create remote stream container first
       this.remoteStream = new MediaStream();
       
       // Request local media with explicit constraints for better quality
@@ -157,7 +153,11 @@ class WebRTCCall {
         }
       }
       
-      // Add local tracks to peer connection AFTER creating the peer connection
+      // FIXED: Create RTCPeerConnection AFTER getting media to avoid issues
+      this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
+      console.log('Created peer connection with config:', PEER_CONFIG);
+      
+      // FIXED: Add local tracks to peer connection immediately after creating it
       if (this.localStream && this.peerConnection) {
         this.localStream.getTracks().forEach(track => {
           console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
@@ -255,33 +255,39 @@ class WebRTCCall {
         event.track.enabled = true;
         
         // Add track to remote stream
-        if (this.remoteStream) {
-          // Important fix: Use event.streams[0] directly if available
-          if (event.streams && event.streams[0]) {
-            console.log('Using event stream directly, has tracks:', event.streams[0].getTracks().length);
-            
-            // Debug log event stream tracks
-            event.streams[0].getTracks().forEach(track => {
-              console.log('Event stream track:', track.kind, track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
-              // Make sure the track is enabled
-              track.enabled = true;
-            });
-            
-            this.remoteStream = event.streams[0];
-          } else {
-            this.remoteStream.addTrack(event.track);
-          }
+        if (!this.remoteStream) {
+          // If somehow remoteStream is null, create a new one
+          this.remoteStream = new MediaStream();
+        }
+
+        // FIXED: Always use event.streams[0] if available, this is critical for proper stream handling
+        if (event.streams && event.streams.length > 0) {
+          console.log('Using event stream directly, has tracks:', event.streams[0].getTracks().length);
           
-          // Debug log remote stream
-          console.log('Remote stream now has tracks:', 
-                     this.remoteStream.getVideoTracks().length, 'video,', 
-                     this.remoteStream.getAudioTracks().length, 'audio');
+          // Debug log event stream tracks
+          event.streams[0].getTracks().forEach(track => {
+            console.log('Event stream track:', track.kind, track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
+            // Make sure the track is enabled
+            track.enabled = true;
+          });
           
-          // Notify about the remote stream
-          if (this.onRemoteStreamCallback) {
-            console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
-            this.onRemoteStreamCallback(this.remoteStream);
-          }
+          // FIXED: Replace remoteStream with the one from the event to maintain synchronization
+          this.remoteStream = event.streams[0];
+        } else {
+          // Fallback: manually add track if event.streams is not available
+          console.log('No event streams, manually adding track to remote stream');
+          this.remoteStream.addTrack(event.track);
+        }
+        
+        // Debug log remote stream
+        console.log('Remote stream now has tracks:', 
+                   this.remoteStream.getVideoTracks().length, 'video,', 
+                   this.remoteStream.getAudioTracks().length, 'audio');
+        
+        // FIXED: Always notify about the remote stream when we get a track
+        if (this.onRemoteStreamCallback) {
+          console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
+          this.onRemoteStreamCallback(this.remoteStream);
         }
         
         // Ensure we mark as connected when we get tracks
@@ -565,12 +571,26 @@ class WebRTCCall {
     try {
       if (!this.peerConnection) return;
       
-      // Create offer with explicit constraints
-      const offer = await this.peerConnection.createOffer({
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: true,
+      // FIXED: Create offer with proper options for cross-browser compatibility
+      // Use a variable to hold options based on browser support
+      let offerOptions: any = {
         iceRestart: true // Important for reconnection
-      });
+      };
+      
+      // Add legacy options for older browsers if createOffer supports them
+      // These properties are deprecated but still needed in some browsers
+      try {
+        offerOptions = {
+          ...offerOptions,
+          offerToReceiveAudio: true, 
+          offerToReceiveVideo: true
+        };
+      } catch (e) {
+        console.log('Browser does not support legacy offer options, using standard options');
+      }
+      
+      console.log('Creating offer with options:', offerOptions);
+      const offer = await this.peerConnection.createOffer(offerOptions);
       
       console.log('Created offer:', offer);
       
@@ -579,7 +599,7 @@ class WebRTCCall {
       console.log('Set local description from offer');
       
       // Wait a bit to ensure ICE candidates are gathered
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 1000));
       
       // Send offer through WebSocket
       this.sendSignal({

@@ -16,27 +16,8 @@ export default defineConfig(({ mode }) => ({
     }
   },
   plugins: [
-    react({
-      // Disable React strict mode in production to avoid double-rendering issues
-      jsxImportSource: undefined,
-      plugins: [],
-      // Fix for React rendering issues with WebRTC
-      fastRefresh: mode !== 'production',
-      // Critical fix for the specific error we're seeing
-      swcOptions: {
-        jsc: {
-          transform: {
-            react: {
-              // Disable development mode features in production
-              development: mode !== 'production',
-              // Disable strict mode to prevent double-rendering
-              useBuiltins: true,
-              refresh: mode !== 'production'
-            }
-          }
-        }
-      }
-    }),
+    // Use default React plugin configuration
+    react(),
     mode === 'development' &&
     componentTagger(),
   ].filter(Boolean),
@@ -56,23 +37,10 @@ export default defineConfig(({ mode }) => ({
   build: {
     // Improve production build stability
     sourcemap: true,
-    minify: 'terser',
-    terserOptions: {
-      compress: {
-        // Disable features that might cause issues with WebRTC
-        keep_infinity: true,
-        pure_getters: false,
-        passes: 1
-      },
-      mangle: {
-        // Prevent mangling of MediaStream related code
-        reserved: ['MediaStream', 'RTCPeerConnection', 'addTrack', 'ontrack']
-      },
-      format: {
-        // Preserve comments with "important" in them
-        comments: /important/
-      }
-    },
+    // Use esbuild for minification instead of terser (which is not installed)
+    minify: 'esbuild',
+    // Configure esbuild minification options
+    target: 'es2015',
     rollupOptions: {
       output: {
         manualChunks: {

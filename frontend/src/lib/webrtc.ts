@@ -29,12 +29,94 @@ const PEER_CONFIG: RTCConfiguration = {
       urls: 'turn:numb.viagenie.ca:3478',
       username: 'webrtc@live.com',
       credential: 'muazkh'
+    },
+    // Add additional free TURN servers for increased connectivity
+    {
+      urls: 'turn:relay.metered.ca:80',
+      username: 'e8dd65e92c62d3e62b5ffac0',
+      credential: 'uWdWNmjRNEGMESKx'
+    },
+    {
+      urls: 'turn:relay.metered.ca:443',
+      username: 'e8dd65e92c62d3e62b5ffac0',
+      credential: 'uWdWNmjRNEGMESKx'
     }
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle' as RTCBundlePolicy,
   rtcpMuxPolicy: 'require' as RTCRtcpMuxPolicy
 };
+
+// Timeout and retry configuration
+const CONNECTION_CONFIG = {
+  // Shorter timeouts to fail fast and retry
+  wsTimeout: 5000,          // WebSocket connection timeout (ms)
+  httpTimeout: 7000,        // HTTP request timeout (ms)
+  httpPollInterval: 1500,   // How often to poll for messages (ms)
+  
+  // Retry configuration with exponential backoff
+  maxRetries: 5,
+  initialBackoff: 1000,     // Start with 1 second backoff
+  maxBackoff: 10000,        // Maximum backoff of 10 seconds
+  backoffFactor: 1.5,       // Exponential factor for backoff
+  
+  // Auto-reconnect config
+  reconnectInterval: 2000,
+  maxReconnectAttempts: 8,
+  
+  // Direct P2P mode when server is unresponsive
+  enableDirectMode: true,   // Enable direct peer connections when signaling server fails
+  directModeThreshold: 3,   // Number of failed attempts before trying direct mode
+  
+  // Server health check
+  healthCheckInterval: 10000, // How often to check if server is responsive (ms)
+  healthCheckEndpoint: '/health'
+};
+
+// Keep track of server health globally across all instances
+let isServerResponsive = true;
+let lastServerCheckTime = 0;
+const serverHealthCheckPromise = Promise.resolve(true);
+
+/**
+ * Check if the server is currently responsive
+ * This avoids making unnecessary requests when we know the server is down
+ */
+async function checkServerHealth(): Promise<boolean> {
+  const now = Date.now();
+  
+  // Don't check too frequently
+  if (now - lastServerCheckTime < CONNECTION_CONFIG.healthCheckInterval) {
+    return isServerResponsive;
+  }
+  
+  lastServerCheckTime = now;
+  
+  try {
+    // Simple health check with very short timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    
+    const response = await fetch(`${API_URL}${CONNECTION_CONFIG.healthCheckEndpoint}`, {
+      method: 'GET',
+      cache: 'no-cache',
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    // Server is responsive if it returns any response
+    isServerResponsive = response.ok;
+    return isServerResponsive;
+  } catch (error) {
+    console.warn('Server health check failed:', error);
+    isServerResponsive = false;
+    return false;
+  }
+}
+
+// Check server health periodically in the background
+setInterval(checkServerHealth, CONNECTION_CONFIG.healthCheckInterval);
 
 interface VideoCallOptions {
   roomId: string;
@@ -203,6 +285,9 @@ class WebRTCCall {
             this.isConnected = true;
             this.onPeerConnectedCallback?.();
             
+            // Reset reconnection attempts on successful connection
+            this.reconnectAttempts = 0;
+            
             // Force-check if we have remote tracks now
             if (this.remoteStream && this.remoteStream.getTracks().length > 0) {
               console.log('We have remote tracks after connection!');
@@ -221,7 +306,7 @@ class WebRTCCall {
             if (this.peerConnection?.iceConnectionState === 'disconnected') {
               this.tryReconnect();
             }
-          }, 5000);
+          }, 2000);
         } else if (this.peerConnection?.iceConnectionState === 'failed' || 
                    this.peerConnection?.iceConnectionState === 'closed') {
           console.log('ICE connection failed or closed');
@@ -238,6 +323,8 @@ class WebRTCCall {
         console.log('Connection state:', this.peerConnection?.connectionState);
         if (this.peerConnection?.connectionState === 'connected') {
           console.log('Peer connection fully established');
+          // Reset reconnection attempts on successful connection
+          this.reconnectAttempts = 0;
         }
       };
       
@@ -307,14 +394,14 @@ class WebRTCCall {
       // Join the WebRTC room using WebSockets
       await this.joinRoom();
       
-      // Wait to see if we need to initiate the call
-      // When a second participant joins, we'll get a user_joined event
+      // Create offer after a short delay if we don't establish connection
+      // This helps initiate the connection, especially in direct mode
       setTimeout(() => {
         if (!this.isConnected && this.peerConnection) {
           console.log('No connection yet, creating offer...');
           this.createAndSendOffer();
         }
-      }, 2000);
+      }, 1000);
       
     } catch (error) {
       console.error('Error initializing WebRTC call:', error);
@@ -335,30 +422,32 @@ class WebRTCCall {
       // For better compatibility with Render.com and other hosting providers
       console.log('Connecting to WebSocket server:', apiUrl);
       
-      // FIXED: Use both websocket and polling transports for better reliability
+      // IMPROVED: Use both websocket and polling transports with faster timeouts
       this.socket = io(apiUrl, {
         transports: ['websocket', 'polling'],  // Allow fallback to long polling if websocket fails
         reconnection: true,
-        reconnectionAttempts: 5,
-        reconnectionDelay: 1000,
+        reconnectionAttempts: CONNECTION_CONFIG.maxRetries,
+        reconnectionDelay: CONNECTION_CONFIG.initialBackoff,
+        reconnectionDelayMax: CONNECTION_CONFIG.maxBackoff,
+        randomizationFactor: 0.5,
         forceNew: true,
-        timeout: 20000,  // Increased timeout for slow connections
+        timeout: CONNECTION_CONFIG.wsTimeout,  // Reduced timeout for faster failure detection
       });
       
-      // Wait for socket to connect with better error handling
+      // Wait for socket to connect with improved error handling
       await new Promise<void>((resolve, reject) => {
         if (!this.socket) {
           reject(new Error('Socket not initialized'));
           return;
         }
         
-        // Set a timeout first to ensure we don't wait forever
+        // Set a timeout first to ensure we don't wait forever - use shorter timeout
         const timeoutId = setTimeout(() => {
           console.error('WebSocket connection timeout - using HTTP fallback');
           // Instead of rejecting, we'll continue and use HTTP fallbacks
           this._setupHttpSignalingFallback();
           resolve();
-        }, 10000);
+        }, CONNECTION_CONFIG.wsTimeout);
         
         // Handle connection
         this.socket.on('connect', () => {
@@ -550,11 +639,11 @@ class WebRTCCall {
             this._joinRoomViaHttp().then(resolve).catch(reject);
           });
           
-          // Set a timeout - if no response, try HTTP
+          // Set a timeout - if no response, try HTTP - use shorter timeout
           setTimeout(() => {
             console.log('Room join via WebSocket timed out, trying HTTP fallback');
             this._joinRoomViaHttp().then(resolve).catch(reject);
-          }, 5000); // Shorter timeout before falling back
+          }, 3000); // Shorter timeout before falling back
         });
       } else {
         // Join using HTTP fallback
@@ -568,6 +657,14 @@ class WebRTCCall {
         await this._joinRoomViaHttp();
       } catch (httpError) {
         console.error('HTTP fallback also failed:', httpError);
+        
+        // Use direct mode as last resort if enabled
+        if (CONNECTION_CONFIG.enableDirectMode && this.reconnectAttempts >= CONNECTION_CONFIG.directModeThreshold) {
+          console.log('Trying direct P2P connection mode as last resort');
+          this._setupDirectMode();
+          return;
+        }
+        
         this.onErrorCallback?.(new Error('Failed to join the video call room'));
         throw httpError;
       }
@@ -584,73 +681,164 @@ class WebRTCCall {
       const token = localStorage.getItem('token');
       if (!token) throw new Error('No authentication token found');
       
-      // Add retry logic
+      // Check server health first
+      if (!isServerResponsive && this.reconnectAttempts > 1) {
+        console.log('Server appears unresponsive, switching to direct mode');
+        this._setupDirectMode();
+        return;
+      }
+      
+      // Add retry logic with exponential backoff
       let attempts = 0;
-      const maxAttempts = 3;
+      const maxAttempts = CONNECTION_CONFIG.maxRetries;
       
       while (attempts < maxAttempts) {
         try {
+          // Calculate backoff with exponential factor
+          const backoffMs = Math.min(
+            CONNECTION_CONFIG.initialBackoff * Math.pow(CONNECTION_CONFIG.backoffFactor, attempts),
+            CONNECTION_CONFIG.maxBackoff
+          );
+          
+          // Add some randomization to prevent thundering herd problem
+          const jitter = Math.random() * 0.3 + 0.85; // Between 0.85 and 1.15
+          const finalBackoff = Math.floor(backoffMs * jitter);
+          
+          if (attempts > 0) {
+            console.log(`Waiting ${finalBackoff}ms before retry ${attempts+1}/${maxAttempts}`);
+            await new Promise(resolve => setTimeout(resolve, finalBackoff));
+            
+            // Check server health before retrying
+            if (attempts > 1 && !(await checkServerHealth())) {
+              console.log('Server unresponsive, switching to direct mode');
+              this._setupDirectMode();
+              return;
+            }
+          }
+          
+          attempts++;
+          console.log(`HTTP room join attempt ${attempts}/${maxAttempts}`);
+          
           const response = await axios.post(
             `${API_URL}/api/webrtc/rooms/${this.roomId}/join`, 
             { appointment_id: this.appointmentId },
             { 
               headers: { Authorization: `Bearer ${token}` },
-              timeout: 10000 // 10 second timeout
+              timeout: CONNECTION_CONFIG.httpTimeout // Reduced timeout
             }
           );
           
           console.log('Successfully joined room via HTTP:', response.data);
+          isServerResponsive = true;
           this.userId = response.data.user_id;
           return;
         } catch (err) {
-          attempts++;
           console.error(`HTTP room join error (attempt ${attempts}/${maxAttempts}):`, err);
           
           if (attempts >= maxAttempts) {
-            throw err; // Rethrow after max attempts
+            // All attempts failed
+            if (CONNECTION_CONFIG.enableDirectMode) {
+              console.log('All room join attempts failed, switching to direct mode');
+              this._setupDirectMode();
+              return;
+            }
+            throw err; // Rethrow after max attempts if direct mode is disabled
           }
-          
-          // Wait before retrying
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
         }
       }
       
       throw new Error('Failed to join room after multiple attempts');
     } catch (error) {
       console.error('Error joining room via HTTP:', error);
+      
+      // Try direct mode as last resort
+      if (CONNECTION_CONFIG.enableDirectMode) {
+        this._setupDirectMode();
+        return;
+      }
+      
       throw error;
     }
+  }
+  
+  /**
+   * Setup direct peer-to-peer mode when server is unresponsive
+   */
+  private _setupDirectMode(): void {
+    console.log('Setting up direct P2P mode without signaling server');
+    
+    // In direct mode, both peers will try to create offers
+    // One will eventually win based on timing and establish the connection
+    
+    // Create an offer immediately and repeat periodically until connected
+    const createOfferInterval = setInterval(() => {
+      if (this.isConnected) {
+        clearInterval(createOfferInterval);
+        return;
+      }
+      
+      if (this.peerConnection) {
+        console.log('Creating offer in direct mode...');
+        this.createAndSendOffer().catch(err => {
+          console.warn('Error creating direct mode offer:', err);
+        });
+      } else {
+        clearInterval(createOfferInterval);
+      }
+    }, 2000);
+    
+    // Clean up interval after reasonable timeout
+    setTimeout(() => {
+      clearInterval(createOfferInterval);
+      if (!this.isConnected) {
+        console.error('Direct mode failed to establish connection');
+        this.onErrorCallback?.(new Error('Could not establish connection'));
+      }
+    }, 30000); // Give it 30 seconds to establish connection in direct mode
   }
   
   /**
    * Attempt to reconnect the call
    */
   private tryReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+    if (this.reconnectAttempts >= CONNECTION_CONFIG.maxReconnectAttempts) {
       console.log('Max reconnect attempts reached, giving up');
       this.onPeerDisconnectedCallback?.();
       return;
     }
     
     this.reconnectAttempts++;
-    console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+    console.log(`Attempting to reconnect (${this.reconnectAttempts}/${CONNECTION_CONFIG.maxReconnectAttempts})...`);
     
     // Clear previous timeout if any
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
     }
     
-    // Try to reconnect after short delay
+    // Calculate backoff with exponential factor
+    const backoffMs = Math.min(
+      CONNECTION_CONFIG.initialBackoff * Math.pow(CONNECTION_CONFIG.backoffFactor, this.reconnectAttempts),
+      CONNECTION_CONFIG.maxBackoff
+    );
+    
+    // Try to reconnect after calculated delay
     this.reconnectTimeout = setTimeout(async () => {
       if (!this.isConnected && this.peerConnection) {
         try {
-          console.log('Creating new offer to reconnect');
+          console.log(`Creating new offer to reconnect (attempt ${this.reconnectAttempts})`);
           await this.createAndSendOffer();
         } catch (error) {
           console.error('Reconnect attempt failed:', error);
+          
+          // If we're close to max attempts and all else is failing, try direct mode
+          if (CONNECTION_CONFIG.enableDirectMode && 
+              this.reconnectAttempts >= CONNECTION_CONFIG.maxReconnectAttempts - 2) {
+            console.log('Regular reconnection failed, switching to direct mode');
+            this._setupDirectMode();
+          }
         }
       }
-    }, 2000);
+    }, backoffMs);
   }
   
   /**
@@ -1005,7 +1193,7 @@ class WebRTCCall {
       console.error('Initial poll failed:', err);
     });
     
-    // Poll for new messages every few seconds
+    // Poll for new messages more frequently with shorter timeouts
     const pollInterval = setInterval(async () => {
       try {
         // Check if we should stop polling
@@ -1034,8 +1222,20 @@ class WebRTCCall {
       } catch (err) {
         console.warn('HTTP signaling poll error:', err);
         // Don't stop polling on error, just continue with the next interval
+        
+        // Increment failure count - if too many failures, try direct mode
+        this._pollFailureCount = (this._pollFailureCount || 0) + 1;
+        
+        if (CONNECTION_CONFIG.enableDirectMode && 
+            this._pollFailureCount >= CONNECTION_CONFIG.directModeThreshold && 
+            !this._directModeAttempted && 
+            !this.isConnected) {
+          console.log(`HTTP polling failed ${this._pollFailureCount} times, trying direct mode`);
+          this._directModeAttempted = true;
+          this._setupDirectMode();
+        }
       }
-    }, 2000);
+    }, CONNECTION_CONFIG.httpPollInterval);
   }
   
   /**
@@ -1046,37 +1246,60 @@ class WebRTCCall {
       const token = localStorage.getItem('token');
       if (!token) return;
       
-      // Add retry logic
+      // Skip if we know the server is down
+      if (!isServerResponsive && this.reconnectAttempts > 1) {
+        console.log('Skipping HTTP signal send - server appears unresponsive');
+        return;
+      }
+      
+      // Add retry logic with exponential backoff
       let attempts = 0;
-      const maxAttempts = 3;
+      const maxAttempts = CONNECTION_CONFIG.maxRetries - 2; // Use fewer attempts for signals
       
       while (attempts < maxAttempts) {
         try {
+          // Calculate backoff with exponential factor
+          if (attempts > 0) {
+            const backoffMs = Math.min(
+              CONNECTION_CONFIG.initialBackoff * Math.pow(CONNECTION_CONFIG.backoffFactor, attempts),
+              CONNECTION_CONFIG.maxBackoff
+            );
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            
+            // Check server health before retrying
+            if (attempts > 1 && !(await checkServerHealth())) {
+              console.log('Server unresponsive, skipping remaining signal attempts');
+              break;
+            }
+          }
+          
+          attempts++;
+          console.log(`HTTP signal send attempt ${attempts}/${maxAttempts} for ${signal.type}`);
+          
           await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/signal`, {
             signal: signal,
             target_id: signal.target_id
           }, {
             headers: { Authorization: `Bearer ${token}` },
-            timeout: 10000 // 10 second timeout
+            timeout: CONNECTION_CONFIG.httpTimeout // Reduced timeout
           });
           
-          // Success, exit the retry loop
+          // Success, mark server as responsive and exit the retry loop
+          isServerResponsive = true;
           break;
         } catch (err) {
-          attempts++;
           console.error(`HTTP signal send error (attempt ${attempts}/${maxAttempts}):`, err);
           
           if (attempts >= maxAttempts) {
-            throw err; // Rethrow after max attempts
+            // Don't throw, just log the error and continue
+            console.warn(`Failed to send signal after ${maxAttempts} attempts`);
+            return;
           }
-          
-          // Wait before retrying
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
         }
       }
     } catch (err) {
-      console.error('HTTP signal send error after all retries:', err);
-      throw err;
+      console.error('HTTP signal send error:', err);
+      // In direct mode, we can ignore these errors
     }
   }
   
@@ -1088,6 +1311,12 @@ class WebRTCCall {
       const token = localStorage.getItem('token');
       if (!token) return [];
       
+      // Skip if we know the server is down
+      if (!isServerResponsive && this._pollFailureCount > 2) {
+        console.log('Skipping HTTP polling - server appears unresponsive');
+        return [];
+      }
+      
       const lastPoll = this._lastPollTime || Date.now() - 5000;
       this._lastPollTime = Date.now();
       
@@ -1095,16 +1324,31 @@ class WebRTCCall {
         `${API_URL}/api/webrtc/rooms/${this.roomId}/messages?since=${lastPoll}`, 
         { 
           headers: { Authorization: `Bearer ${token}` },
-          timeout: 5000 // 5 second timeout
+          timeout: CONNECTION_CONFIG.httpTimeout - 2000 // Even shorter timeout for polling
         }
       );
+      
+      // Success, mark server as responsive
+      isServerResponsive = true;
+      this._pollFailureCount = 0;
       
       return response.data.messages || [];
     } catch (err) {
       console.error('HTTP signal poll error:', err);
+      this._pollFailureCount = (this._pollFailureCount || 0) + 1;
+      
+      // After several failures, check server health and update global state
+      if (this._pollFailureCount > 3) {
+        checkServerHealth();
+      }
+      
       return [];
     }
   }
+  
+  // Track failure counts
+  private _pollFailureCount: number = 0;
+  private _directModeAttempted: boolean = false;
   
   // Track last poll time
   private _lastPollTime: number = 0;

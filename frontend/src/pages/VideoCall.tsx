@@ -10,6 +10,14 @@ import { API_URL } from "@/config";
 import { Clock, Phone, PhoneOff, Video, VideoOff, Mic, MicOff } from "lucide-react";
 import { MdVideocam, MdVideocamOff, MdMic, MdMicOff, MdCallEnd } from 'react-icons/md';
 
+// Connection management constants
+const CONNECTION_MANAGEMENT = {
+  statusPollInterval: 2000,    // How often to check participant status (ms)
+  maxConnectionTime: 45000,    // Max time to wait for connection before auto-refresh (ms)
+  reconnectDelay: 2000,        // Delay before recreating WebRTC after errors (ms)
+  participantCheckThreshold: 3 // How many status checks before triggering refresh
+};
+
 /**
  * VideoCall component for real-time WebRTC consultations
  */
@@ -34,6 +42,9 @@ const VideoCall: React.FC = () => {
   const [patientJoined, setPatientJoined] = useState(false);
   const [currentRole, setCurrentRole] = useState<string>('');
   const [roomId, setRoomId] = useState<string>('');
+  const [connectionAttempts, setConnectionAttempts] = useState<number>(0);
+  const [participantCheckCounter, setParticipantCheckCounter] = useState<number>(0);
+  const [refreshingConnection, setRefreshingConnection] = useState<boolean>(false);
 
   // WebRTC
   const webrtcRef = useRef<WebRTCCall | null>(null);
@@ -41,6 +52,8 @@ const VideoCall: React.FC = () => {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const roomStatusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const connectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshingRef = useRef<boolean>(false);
 
   // Load user data and fetch consultation in one effect
   useEffect(() => {
@@ -128,9 +141,14 @@ const VideoCall: React.FC = () => {
     fetchConsultation();
   }, [appointmentId, navigate, toast]);
   
-  // Start polling for room status to check participant join status
+  // Start aggressive polling for room status to check participant join status
   useEffect(() => {
     if (!appointmentId || !securityVerified) return;
+    
+    // Internal counter for checking consecutive status consistency
+    let missedParticipantCounter = 0;
+    let otherParticipantJoined = false;
+    let expectingOtherParticipant = currentRole === 'doctor' ? patientJoined : doctorJoined;
     
     const pollRoomStatus = async () => {
       try {
@@ -147,17 +165,37 @@ const VideoCall: React.FC = () => {
           // Update participant status
           setDoctorJoined(data.doctor_joined);
           setPatientJoined(data.patient_joined);
+
+          // Check if the other participant is joined according to the server
+          otherParticipantJoined = currentRole === 'doctor' ? data.patient_joined : data.doctor_joined;
+          
+          // If status differs from what we expect based on connection state
+          if (expectingOtherParticipant !== otherParticipantJoined) {
+            missedParticipantCounter++;
+            
+            // If we've seen inconsistent status multiple times and we're not already refreshing
+            if (missedParticipantCounter >= CONNECTION_MANAGEMENT.participantCheckThreshold && 
+                !refreshingRef.current && 
+                callStatus !== 'connected') {
+              console.log(`Participant status mismatch detected ${missedParticipantCounter} times, refreshing connection`);
+              refreshConnection();
+            }
+          } else {
+            // Reset counter when status is consistent
+            missedParticipantCounter = 0;
+          }
         }
       } catch (err) {
         console.error('Error polling room status:', err);
+        // Don't increment counter on network errors
       }
     };
     
     // Initial poll
     pollRoomStatus();
     
-    // Set up interval
-    roomStatusIntervalRef.current = setInterval(pollRoomStatus, 5000);
+    // Set up more frequent polling
+    roomStatusIntervalRef.current = setInterval(pollRoomStatus, CONNECTION_MANAGEMENT.statusPollInterval);
     
     // Clean up interval on unmount
     return () => {
@@ -165,206 +203,244 @@ const VideoCall: React.FC = () => {
         clearInterval(roomStatusIntervalRef.current);
       }
     };
-  }, [appointmentId, securityVerified]);
+  }, [appointmentId, securityVerified, currentRole, doctorJoined, patientJoined, callStatus]);
   
-  // Initialize WebRTC when consultation is loaded
-  useEffect(() => {
-    if (!securityVerified || !consultation?.video_call_id) return;
+  // Function to refresh connection when needed
+  const refreshConnection = () => {
+    if (refreshingRef.current) {
+      return; // Prevent multiple simultaneous refreshes
+    }
     
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let reconnectAttempts = 0;
-    const maxReconnectAttempts = 3;
+    refreshingRef.current = true;
+    setRefreshingConnection(true);
+    setError("Connection issues detected. Refreshing connection...");
     
-    const initializeWebRTC = async () => {
-      try {
-        console.log(`Initializing WebRTC call (attempt ${reconnectAttempts + 1}/${maxReconnectAttempts + 1})`);
-        setLastConnectAttempt(new Date());
-        
-        // FIXED: Use video_call_id instead of room_id for consistency
-        const roomId = consultation.video_call_id;
-        console.log(`Using room ID: ${roomId} for WebRTC connection`);
+    console.log("Refreshing WebRTC connection due to status inconsistencies");
+    
+    // Clean up existing connection
+    if (webrtcRef.current) {
+      webrtcRef.current.endCall();
+      webrtcRef.current = null;
+    }
+    
+    // Reset state but keep participant flags since the server knows who's joined
+    setCallStatus('waiting');
+    setHasRemoteVideo(false);
+    
+    // Increment connection attempts
+    setConnectionAttempts(prev => prev + 1);
+    
+    // Wait a moment before reconnecting
+    setTimeout(() => {
+      initializeWebRTCCall();
+      refreshingRef.current = false;
+      setRefreshingConnection(false);
+    }, CONNECTION_MANAGEMENT.reconnectDelay);
+  };
+  
+  // Initialize WebRTC - extracted to separate function for reuse during reconnections
+  const initializeWebRTCCall = async () => {
+    if (!securityVerified || !consultation?.video_call_id) {
+      return;
+    }
+    
+    try {
+      console.log(`Initializing WebRTC call with room ID: ${consultation.video_call_id}`);
+      setLastConnectAttempt(new Date());
       
-        // Create WebRTC call instance
-        const webrtcCall = new WebRTCCall({
-          roomId: roomId,
-          appointmentId: appointmentId || '',
-          onLocalStream: (stream) => {
-            console.log('Got local stream in component');
-            if (localVideoRef.current) {
-              localVideoRef.current.srcObject = stream;
-              
-              // Enable autoplay for mobile devices
-              localVideoRef.current.onloadedmetadata = () => {
-                console.log('Local video metadata loaded');
-                localVideoRef.current?.play().catch(e => {
-                  console.error('Error auto-playing local video:', e);
-                });
-              };
-            }
+      // Create WebRTC call instance
+      const webrtcCall = new WebRTCCall({
+        roomId: consultation.video_call_id,
+        appointmentId: appointmentId || '',
+        onLocalStream: (stream) => {
+          console.log('Got local stream in component');
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = stream;
             
-            // Update joined status for current user
-            const userRole = localStorage.getItem('userRole');
-            if (userRole === 'doctor') {
-              setDoctorJoined(true);
-            } else if (userRole === 'patient') {
-              setPatientJoined(true);
-            }
-          },
-          onRemoteStream: (stream) => {
-            console.log('Got remote stream in component');
-            if (remoteVideoRef.current) {
-              // Store remote stream in video element
-              remoteVideoRef.current.srcObject = stream;
-              
-              // FIXED: Clear error state when we get a stream
-              setError(null);
-              
-              // Set event handlers to handle autoplay issues
-              remoteVideoRef.current.onloadedmetadata = () => {
-                console.log('Remote video metadata loaded');
-                // Try to auto-play when loaded (needed for mobile browsers)
-                remoteVideoRef.current?.play().catch(e => {
-                  console.error('Error auto-playing remote video:', e);
-                  // If autoplay fails, show a play button or message
-                  setError('Tap the video to enable playback');
-                });
-              };
-              
-              // Ensure tracks are enabled
-              const videoTracks = stream.getVideoTracks();
-              const audioTracks = stream.getAudioTracks();
-              
-              // Log the tracks we received
-              console.log(`Remote stream has ${videoTracks.length} video tracks and ${audioTracks.length} audio tracks`);
-              
-              // FIXED: Ensure both video and audio tracks are properly enabled
-              videoTracks.forEach(track => {
-                console.log(`Remote video track: ${track.id}, enabled: ${track.enabled}`);
-                track.enabled = true; // Ensure video is enabled
+            // Enable autoplay for mobile devices
+            localVideoRef.current.onloadedmetadata = () => {
+              console.log('Local video metadata loaded');
+              localVideoRef.current?.play().catch(e => {
+                console.error('Error auto-playing local video:', e);
               });
-              
-              audioTracks.forEach(track => {
-                console.log(`Remote audio track: ${track.id}, enabled: ${track.enabled}`);
-                track.enabled = true; // Ensure audio is enabled
+            };
+          }
+          
+          // Update joined status for current user
+          const userRole = localStorage.getItem('userRole');
+          if (userRole === 'doctor') {
+            setDoctorJoined(true);
+          } else if (userRole === 'patient') {
+            setPatientJoined(true);
+          }
+        },
+        onRemoteStream: (stream) => {
+          console.log('Got remote stream in component');
+          if (remoteVideoRef.current) {
+            // Store remote stream in video element
+            remoteVideoRef.current.srcObject = stream;
+            
+            // FIXED: Clear error state when we get a stream
+            setError(null);
+            
+            // Set event handlers to handle autoplay issues
+            remoteVideoRef.current.onloadedmetadata = () => {
+              console.log('Remote video metadata loaded');
+              // Try to auto-play when loaded (needed for mobile browsers)
+              remoteVideoRef.current?.play().catch(e => {
+                console.error('Error auto-playing remote video:', e);
+                // If autoplay fails, show a play button or message
+                setError('Tap the video to enable playback');
               });
-              
-              // FIXED: Set hasRemoteVideo based on active track state, not just presence
-              setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(track => track.enabled));
-              
-              // When we receive a remote stream, the other participant has joined
-              const userRole = localStorage.getItem('userRole');
-              if (userRole === 'doctor') {
-                setPatientJoined(true);
-              } else {
-                setDoctorJoined(true);
-              }
-            }
-          },
-          onPeerConnected: () => {
-            console.log('Peer connected');
-            setCallStatus('connected');
-            // Clear reconnect attempts on successful connection
-            reconnectAttempts = 0;
+            };
             
-            // Start timer for call duration
-            if (durationTimerRef.current) {
-              clearInterval(durationTimerRef.current);
-            }
-            durationTimerRef.current = setInterval(() => {
-              setCallDuration(prev => prev + 1);
-            }, 1000);
+            // Ensure tracks are enabled
+            const videoTracks = stream.getVideoTracks();
+            const audioTracks = stream.getAudioTracks();
             
-            // The remote peer has definitely joined if we're connected
+            // Log the tracks we received
+            console.log(`Remote stream has ${videoTracks.length} video tracks and ${audioTracks.length} audio tracks`);
+            
+            // FIXED: Ensure both video and audio tracks are properly enabled
+            videoTracks.forEach(track => {
+              console.log(`Remote video track: ${track.id}, enabled: ${track.enabled}`);
+              track.enabled = true; // Ensure video is enabled
+            });
+            
+            audioTracks.forEach(track => {
+              console.log(`Remote audio track: ${track.id}, enabled: ${track.enabled}`);
+              track.enabled = true; // Ensure audio is enabled
+            });
+            
+            // FIXED: Set hasRemoteVideo based on active track state, not just presence
+            setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(track => track.enabled));
+            
+            // When we receive a remote stream, the other participant has joined
             const userRole = localStorage.getItem('userRole');
             if (userRole === 'doctor') {
               setPatientJoined(true);
             } else {
               setDoctorJoined(true);
             }
-          },
-          onPeerDisconnected: () => {
-            console.log('Peer disconnected');
-            setCallStatus('disconnected');
-            setHasRemoteVideo(false);
-            
-            // Update joined status for the other participant
-            const userRole = localStorage.getItem('userRole');
-            if (userRole === 'doctor') {
-              setPatientJoined(false);
-            } else {
-              setDoctorJoined(false);
-            }
-            
-            // Stop timer
-            if (durationTimerRef.current) {
-              clearInterval(durationTimerRef.current);
-              durationTimerRef.current = null;
-            }
-          },
-          onError: (error) => {
-            console.error('WebRTC error:', error);
+          }
+        },
+        onPeerConnected: () => {
+          console.log('Peer connected');
+          setCallStatus('connected');
+          
+          // Clear connection timer since we're now connected
+          if (connectionTimerRef.current) {
+            clearTimeout(connectionTimerRef.current);
+            connectionTimerRef.current = null;
+          }
+          
+          // Reset refresh-related state
+          refreshingRef.current = false;
+          setRefreshingConnection(false);
+          setError(null);
+          
+          // Start timer for call duration
+          if (durationTimerRef.current) {
+            clearInterval(durationTimerRef.current);
+          }
+          durationTimerRef.current = setInterval(() => {
+            setCallDuration(prev => prev + 1);
+          }, 1000);
+          
+          // The remote peer has definitely joined if we're connected
+          const userRole = localStorage.getItem('userRole');
+          if (userRole === 'doctor') {
+            setPatientJoined(true);
+          } else {
+            setDoctorJoined(true);
+          }
+        },
+        onPeerDisconnected: () => {
+          console.log('Peer disconnected');
+          setCallStatus('disconnected');
+          setHasRemoteVideo(false);
+          
+          // Update joined status for the other participant
+          const userRole = localStorage.getItem('userRole');
+          if (userRole === 'doctor') {
+            setPatientJoined(false);
+          } else {
+            setDoctorJoined(false);
+          }
+          
+          // Stop timer
+          if (durationTimerRef.current) {
+            clearInterval(durationTimerRef.current);
+            durationTimerRef.current = null;
+          }
+        },
+        onError: (error) => {
+          console.error('WebRTC error:', error);
+          setError(`Connection error: ${error.message}. Attempting to recover...`);
+          
+          // Don't display toasts for timeout errors as they're expected with poor server connectivity
+          if (!error.message.includes('timeout')) {
             toast({
               title: "Video Call Error",
               description: error.message,
               variant: "destructive"
             });
-            
-            // Try to reconnect on error if we haven't exceeded attempts
-            if (reconnectAttempts < maxReconnectAttempts) {
-              reconnectAttempts++;
-              setError(`Connection error. Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts})...`);
-              
-              if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-              }
-              
-              reconnectTimer = setTimeout(() => {
-                // Clean up previous instance
-                if (webrtcRef.current) {
-                  webrtcRef.current.endCall();
-                  webrtcRef.current = null;
-                }
-                
-                // Try to initialize again
-                initializeWebRTC();
-              }, 3000);
-            }
-          }
-        });
-        
-        // Store reference and change status
-        webrtcRef.current = webrtcCall;
-        setCallStatus('connecting');
-        
-        // Initialize connection
-        await webrtcCall.initialize();
-        
-      } catch (error: any) {
-        console.error('Error initializing WebRTC call:', error);
-        
-        // Try to reconnect if we haven't exceeded attempts
-        if (reconnectAttempts < maxReconnectAttempts) {
-          reconnectAttempts++;
-          setError(`Failed to start video call. Retrying (${reconnectAttempts}/${maxReconnectAttempts})...`);
-          
-          if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
           }
           
-          reconnectTimer = setTimeout(initializeWebRTC, 3000);
-        } else {
-          toast({
-            title: "Failed to start video call",
-            description: error.message,
-            variant: "destructive"
-          });
-          setCallStatus('disconnected');
+          // After multiple errors, try refreshing the call completely
+          if (connectionAttempts < 3) {
+            setConnectionAttempts(prev => prev + 1);
+          } else {
+            refreshConnection();
+          }
         }
+      });
+      
+      // Store reference and change status
+      webrtcRef.current = webrtcCall;
+      setCallStatus('connecting');
+      
+      // Initialize connection
+      await webrtcCall.initialize();
+      
+      // Set a timeout to auto-refresh if connection doesn't establish in reasonable time
+      if (connectionTimerRef.current) {
+        clearTimeout(connectionTimerRef.current);
       }
-    };
+      
+      connectionTimerRef.current = setTimeout(() => {
+        // If we're still not connected after the timeout, force a refresh
+        if (callStatus !== 'connected' && !refreshingRef.current) {
+          console.log('Connection taking too long, forcing refresh');
+          refreshConnection();
+        }
+      }, CONNECTION_MANAGEMENT.maxConnectionTime);
+      
+    } catch (error: any) {
+      console.error('Error initializing WebRTC call:', error);
+      setError(`Failed to start video call: ${error.message}. Retrying...`);
+      
+      // Retry after delay if not already over the attempt limit
+      if (connectionAttempts < 5) {
+        setTimeout(() => {
+          setConnectionAttempts(prev => prev + 1);
+          initializeWebRTCCall();
+        }, CONNECTION_MANAGEMENT.reconnectDelay);
+      } else {
+        setCallStatus('disconnected');
+        setError('Could not establish video call after multiple attempts. Please try rejoining the call.');
+      }
+    }
+  };
+  
+  // Initialize WebRTC when consultation is loaded
+  useEffect(() => {
+    if (!securityVerified || !consultation?.video_call_id) return;
     
-    // Start the initialization process
-    initializeWebRTC();
+    // Reset connection attempts when component mounts or consultation changes
+    setConnectionAttempts(0);
+    
+    initializeWebRTCCall();
     
     // Cleanup function
     return () => {
@@ -378,11 +454,12 @@ const VideoCall: React.FC = () => {
         durationTimerRef.current = null;
       }
       
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
+      if (connectionTimerRef.current) {
+        clearTimeout(connectionTimerRef.current);
+        connectionTimerRef.current = null;
       }
     };
-  }, [appointmentId, consultation, securityVerified, toast, navigate]);
+  }, [appointmentId, consultation, securityVerified]);
   
   // Handle toggle video
   const toggleVideo = () => {
@@ -413,6 +490,12 @@ const VideoCall: React.FC = () => {
       }
     }
   };
+
+  // Manual reconnect function the user can trigger if needed
+  const handleManualReconnect = () => {
+    console.log('User requested manual reconnection');
+    refreshConnection();
+  };
   
   // Handle end call
   const endCall = async () => {
@@ -429,6 +512,11 @@ const VideoCall: React.FC = () => {
     if (roomStatusIntervalRef.current) {
       clearInterval(roomStatusIntervalRef.current);
       roomStatusIntervalRef.current = null;
+    }
+    
+    if (connectionTimerRef.current) {
+      clearTimeout(connectionTimerRef.current);
+      connectionTimerRef.current = null;
     }
     
     toast({
@@ -543,7 +631,9 @@ const VideoCall: React.FC = () => {
       doctorJoined,
       patientJoined,
       callStatus,
-      appointmentId
+      appointmentId,
+      connectionAttempts,
+      refreshing: refreshingRef.current,
     });
   };
 
@@ -581,6 +671,16 @@ const VideoCall: React.FC = () => {
                 <div className="animate-pulse mt-8">
                   <Phone className="h-16 w-16 mx-auto text-green-500" />
                 </div>
+                {connectionAttempts > 0 && (
+                  <div className="text-sm text-gray-400">
+                    Connection attempts: {connectionAttempts}
+                  </div>
+                )}
+                {refreshingConnection && (
+                  <div className="text-sm text-blue-400 animate-pulse">
+                    Refreshing connection...
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -591,13 +691,20 @@ const VideoCall: React.FC = () => {
               <div className="text-center space-y-4">
                 <h2 className="text-2xl font-bold">Call Ended</h2>
                 <p>{remoteUserName} has left the consultation</p>
-              <Button 
-                variant="outline" 
+                <Button 
+                  variant="outline" 
                   className="mt-4"
                   onClick={() => navigate('/')}
-              >
+                >
                   Return to Home
-              </Button>
+                </Button>
+                <Button 
+                  variant="outline" 
+                  className="mt-4"
+                  onClick={handleManualReconnect}
+                >
+                  Try to Reconnect
+                </Button>
               </div>
             </div>
           )}
@@ -636,12 +743,28 @@ const VideoCall: React.FC = () => {
             {patientJoined && (
               <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
             )}
+            {connectionAttempts > 0 && (
+              <Badge variant="outline" className="bg-blue-600 bg-opacity-50">Attempt #{connectionAttempts}</Badge>
+            )}
           </div>
           
           {/* Error message */}
           {error && (
             <div className="absolute top-4 left-0 right-0 mx-auto max-w-sm bg-red-500 text-white p-2 rounded text-center">
               {error}
+            </div>
+          )}
+          
+          {/* Manual reconnect button when there are issues but not while actively reconnecting */}
+          {error && !refreshingConnection && (
+            <div className="absolute bottom-20 left-0 right-0 mx-auto text-center">
+              <Button 
+                variant="default"
+                className="bg-blue-600"
+                onClick={handleManualReconnect}
+              >
+                Refresh Connection
+              </Button>
             </div>
           )}
         </div>
@@ -662,32 +785,32 @@ const VideoCall: React.FC = () => {
                   <Badge variant="default" className="bg-green-600">Live</Badge>
                 </div>
               )}
-        </div>
+            </div>
 
             <div className="flex space-x-2">
-                    <Button 
+              <Button 
                 variant={videoEnabled ? "default" : "destructive"}
-                        size="icon" 
-                        onClick={toggleVideo}
-                      >
+                size="icon" 
+                onClick={toggleVideo}
+              >
                 {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
-                      </Button>
+              </Button>
               
-                      <Button 
+              <Button 
                 variant={audioEnabled ? "default" : "destructive"}
-                        size="icon" 
-                        onClick={toggleAudio}
-                      >
+                size="icon" 
+                onClick={toggleAudio}
+              >
                 {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
-                      </Button>
+              </Button>
               
-                      <Button 
+              <Button 
                 variant="destructive"
-                        size="icon" 
-                        onClick={endCall}
-                      >
+                size="icon" 
+                onClick={endCall}
+              >
                 <PhoneOff className="h-4 w-4" />
-                      </Button>
+              </Button>
             </div>
           </div>
         </Card>

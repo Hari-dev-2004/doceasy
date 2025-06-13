@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, Suspense, lazy, StrictMode } from "react";
+import React, { useEffect, useRef, useState, Suspense, lazy } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import axios from "axios";
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +17,108 @@ const CONNECTION_MANAGEMENT = {
   reconnectDelay: 2000,        // Delay before recreating WebRTC after errors (ms)
   participantCheckThreshold: 3 // How many status checks before triggering refresh
 };
+
+// Create a completely separate video element handler that bypasses React
+// This is crucial to avoid React rendering issues with WebRTC
+class VideoHandler {
+  private static instance: VideoHandler | null = null;
+  private localVideoElement: HTMLVideoElement | null = null;
+  private remoteVideoElement: HTMLVideoElement | null = null;
+  private localStream: MediaStream | null = null;
+  private remoteStream: MediaStream | null = null;
+  
+  // Singleton pattern
+  public static getInstance(): VideoHandler {
+    if (!VideoHandler.instance) {
+      VideoHandler.instance = new VideoHandler();
+    }
+    return VideoHandler.instance;
+  }
+  
+  // Register video elements
+  public registerLocalVideo(element: HTMLVideoElement | null): void {
+    this.localVideoElement = element;
+    if (this.localVideoElement && this.localStream) {
+      this.attachLocalStream(this.localStream);
+    }
+  }
+  
+  public registerRemoteVideo(element: HTMLVideoElement | null): void {
+    this.remoteVideoElement = element;
+    if (this.remoteVideoElement && this.remoteStream) {
+      this.attachRemoteStream(this.remoteStream);
+    }
+  }
+  
+  // Attach streams to video elements
+  public attachLocalStream(stream: MediaStream | null): void {
+    this.localStream = stream;
+    if (!this.localVideoElement || !stream) return;
+    
+    try {
+      // Avoid React's rendering cycle completely
+      if (this.localVideoElement.srcObject !== stream) {
+        this.localVideoElement.srcObject = stream;
+        this.localVideoElement.muted = true; // Always mute local video
+        
+        this.localVideoElement.onloadedmetadata = () => {
+          this.localVideoElement?.play().catch(e => {
+            console.error('Error playing local video:', e);
+          });
+        };
+      }
+    } catch (error) {
+      console.error('Error attaching local stream:', error);
+    }
+  }
+  
+  public attachRemoteStream(stream: MediaStream | null): void {
+    this.remoteStream = stream;
+    if (!this.remoteVideoElement || !stream) return;
+    
+    try {
+      // Avoid React's rendering cycle completely
+      if (this.remoteVideoElement.srcObject !== stream) {
+        this.remoteVideoElement.srcObject = stream;
+        
+        this.remoteVideoElement.onloadedmetadata = () => {
+          this.remoteVideoElement?.play().catch(e => {
+            console.error('Error playing remote video:', e);
+            // Try again
+            setTimeout(() => {
+              this.remoteVideoElement?.play().catch(console.error);
+            }, 1000);
+          });
+        };
+      }
+    } catch (error) {
+      console.error('Error attaching remote stream:', error);
+    }
+  }
+  
+  // Check if video has tracks
+  public hasRemoteVideoTracks(): boolean {
+    if (!this.remoteStream) return false;
+    const videoTracks = this.remoteStream.getVideoTracks();
+    return videoTracks.length > 0 && videoTracks[0].enabled;
+  }
+  
+  // Clean up
+  public cleanup(): void {
+    this.localStream = null;
+    this.remoteStream = null;
+    
+    if (this.localVideoElement) {
+      this.localVideoElement.srcObject = null;
+      this.localVideoElement = null;
+    }
+    
+    if (this.remoteVideoElement) {
+      this.remoteVideoElement.srcObject = null;
+      this.remoteVideoElement = null;
+    }
+  }
+}
 
 // Create a separate error boundary component
 class VideoCallErrorBoundary extends React.Component<
@@ -93,61 +195,6 @@ class VideoCallErrorBoundary extends React.Component<
   }
 }
 
-// Create a simplified video component to isolate rendering issues
-const SafeVideoElement = ({ 
-  videoRef, 
-  className, 
-  autoPlay = true, 
-  playsInline = true,
-  muted = false
-}: {
-  videoRef: React.RefObject<HTMLVideoElement>;
-  className?: string;
-  autoPlay?: boolean;
-  playsInline?: boolean;
-  muted?: boolean;
-}) => {
-  // Use a simple rendering approach to avoid complex React reconciliation issues
-  return (
-    <video
-      ref={videoRef}
-      className={className || ''}
-      autoPlay={autoPlay}
-      playsInline={playsInline}
-      muted={muted}
-      onError={(e) => {
-        console.error('Video element error:', e);
-      }}
-    />
-  );
-};
-
-// Add this function to safely handle stream assignment to video elements
-const safelyAssignStream = (videoRef: React.RefObject<HTMLVideoElement>, stream: MediaStream | null) => {
-  try {
-    if (!videoRef.current) return;
-    
-    // Check if the stream is the same to avoid unnecessary updates
-    if (videoRef.current.srcObject === stream) return;
-    
-    // Use setTimeout to avoid React rendering errors
-    setTimeout(() => {
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        
-        // Handle autoplay
-        if (stream) {
-          videoRef.current.play().catch(e => {
-            console.error('Error auto-playing video:', e);
-          });
-        }
-      }
-    }, 0);
-  } catch (error) {
-    console.error('Error assigning stream to video element:', error);
-  }
-};
-
 /**
  * VideoCall component for real-time WebRTC consultations
  */
@@ -184,6 +231,19 @@ const VideoCall: React.FC = () => {
   const roomStatusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshingRef = useRef<boolean>(false);
+  
+  // Get video handler instance
+  const videoHandler = VideoHandler.getInstance();
+  
+  // Register video elements with the handler
+  useEffect(() => {
+    videoHandler.registerLocalVideo(localVideoRef.current);
+    videoHandler.registerRemoteVideo(remoteVideoRef.current);
+    
+    return () => {
+      videoHandler.cleanup();
+    };
+  }, []);
 
   // Load user data and fetch consultation in one effect
   useEffect(() => {
@@ -335,53 +395,33 @@ const VideoCall: React.FC = () => {
     };
   }, [appointmentId, securityVerified, currentRole, doctorJoined, patientJoined, callStatus]);
   
-  // Function to refresh connection when needed
-  const refreshConnection = () => {
-    console.log('Refreshing WebRTC connection');
+  // Initialize WebRTC when consultation is loaded
+  useEffect(() => {
+    if (!securityVerified || !consultation?.video_call_id) return;
     
-    // Prevent multiple simultaneous refreshes
-    if (refreshingRef.current) {
-      console.log('Already refreshing, skipping');
-      return;
-    }
+    // Reset connection attempts when component mounts or consultation changes
+    setConnectionAttempts(0);
     
-    try {
-      refreshingRef.current = true;
-      setRefreshingConnection(true);
-      setError('Connection issues detected. Refreshing connection...');
-      
-      // Clean up existing connection
+    initializeWebRTCCall();
+    
+    // Cleanup function
+    return () => {
       if (webrtcRef.current) {
-        webrtcRef.current.endCall().catch(e => {
-          console.error('Error ending call during refresh:', e);
-        });
+        webrtcRef.current.endCall();
         webrtcRef.current = null;
       }
       
-      // Reset state
-      setCallStatus('waiting');
-      setHasRemoteVideo(false);
+      if (durationTimerRef.current) {
+        clearInterval(durationTimerRef.current);
+        durationTimerRef.current = null;
+      }
       
-      // Delay before reconnecting to allow cleanup
-      setTimeout(() => {
-        console.log('Initializing new WebRTC connection after refresh');
-        initializeWebRTCCall();
-      }, CONNECTION_MANAGEMENT.reconnectDelay);
-    } catch (error) {
-      console.error('Error during connection refresh:', error);
-      
-      // Ensure we reset the refreshing flags even on error
-      refreshingRef.current = false;
-      setRefreshingConnection(false);
-      
-      // Last resort - reload the page
-      toast({
-        title: "Connection Failed",
-        description: "Please reload the page to try again.",
-        variant: "destructive"
-      });
-    }
-  };
+      if (connectionTimerRef.current) {
+        clearTimeout(connectionTimerRef.current);
+        connectionTimerRef.current = null;
+      }
+    };
+  }, [appointmentId, consultation, securityVerified]);
   
   // Initialize WebRTC - extracted to separate function for reuse during reconnections
   const initializeWebRTCCall = async () => {
@@ -399,18 +439,9 @@ const VideoCall: React.FC = () => {
         appointmentId: appointmentId || '',
         onLocalStream: (stream) => {
           console.log('Got local stream in component');
-          if (localVideoRef.current) {
-            // Use our safe method instead of direct assignment
-            safelyAssignStream(localVideoRef, stream);
-            
-            // Enable autoplay for mobile devices
-            localVideoRef.current.onloadedmetadata = () => {
-              console.log('Local video metadata loaded');
-              localVideoRef.current?.play().catch(e => {
-                console.error('Error auto-playing local video:', e);
-              });
-            };
-          }
+          
+          // Use video handler instead of React refs
+          videoHandler.attachLocalStream(stream);
           
           // Update joined status for current user
           const userRole = localStorage.getItem('userRole');
@@ -423,15 +454,9 @@ const VideoCall: React.FC = () => {
         onRemoteStream: (stream) => {
           console.log('Got remote stream in component');
           
-          // Safety check to prevent errors with null refs
-          if (!remoteVideoRef.current) {
-            console.warn('Remote video ref is null, cannot attach stream');
-            return;
-          }
-          
           try {
-            // Use our safe method instead of direct assignment
-            safelyAssignStream(remoteVideoRef, stream);
+            // Use video handler instead of React refs
+            videoHandler.attachRemoteStream(stream);
             
             // Check if we have video tracks
             const videoTracks = stream.getVideoTracks();
@@ -574,33 +599,53 @@ const VideoCall: React.FC = () => {
     }
   };
   
-  // Initialize WebRTC when consultation is loaded
-  useEffect(() => {
-    if (!securityVerified || !consultation?.video_call_id) return;
+  // Function to refresh connection when needed
+  const refreshConnection = () => {
+    console.log('Refreshing WebRTC connection');
     
-    // Reset connection attempts when component mounts or consultation changes
-    setConnectionAttempts(0);
+    // Prevent multiple simultaneous refreshes
+    if (refreshingRef.current) {
+      console.log('Already refreshing, skipping');
+      return;
+    }
     
-    initializeWebRTCCall();
-    
-    // Cleanup function
-    return () => {
+    try {
+      refreshingRef.current = true;
+      setRefreshingConnection(true);
+      setError('Connection issues detected. Refreshing connection...');
+      
+      // Clean up existing connection
       if (webrtcRef.current) {
-        webrtcRef.current.endCall();
+        webrtcRef.current.endCall().catch(e => {
+          console.error('Error ending call during refresh:', e);
+        });
         webrtcRef.current = null;
       }
       
-      if (durationTimerRef.current) {
-        clearInterval(durationTimerRef.current);
-        durationTimerRef.current = null;
-      }
+      // Reset state
+      setCallStatus('waiting');
+      setHasRemoteVideo(false);
       
-      if (connectionTimerRef.current) {
-        clearTimeout(connectionTimerRef.current);
-        connectionTimerRef.current = null;
-      }
-    };
-  }, [appointmentId, consultation, securityVerified]);
+      // Delay before reconnecting to allow cleanup
+      setTimeout(() => {
+        console.log('Initializing new WebRTC connection after refresh');
+        initializeWebRTCCall();
+      }, CONNECTION_MANAGEMENT.reconnectDelay);
+    } catch (error) {
+      console.error('Error during connection refresh:', error);
+      
+      // Ensure we reset the refreshing flags even on error
+      refreshingRef.current = false;
+      setRefreshingConnection(false);
+      
+      // Last resort - reload the page
+      toast({
+        title: "Connection Failed",
+        description: "Please reload the page to try again.",
+        variant: "destructive"
+      });
+    }
+  };
   
   // Handle toggle video
   const toggleVideo = () => {
@@ -677,26 +722,17 @@ const VideoCall: React.FC = () => {
 
   // Add manual play handler for mobile browsers that block autoplay
   const handleManualPlay = () => {
-    // FIXED: Check if we have streams before attempting to play
+    // Try to play videos manually
     if (remoteVideoRef.current && remoteVideoRef.current.srcObject) {
       if (remoteVideoRef.current.paused) {
         console.log('Attempting to manually play remote video');
         remoteVideoRef.current.play().then(() => {
           setError(null);
-          
-          // FIXED: Check for active video tracks when manual play succeeds
-          const stream = remoteVideoRef.current?.srcObject as MediaStream | null;
-          if (stream) {
-            const videoTracks = stream.getVideoTracks();
-            setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(t => t.enabled));
-          }
         }).catch(e => {
           console.error('Failed to play remote video manually:', e);
           setError('Video playback was blocked by your browser. Please check your permissions.');
         });
       }
-    } else {
-      console.log('Remote video element or stream not available for manual play');
     }
     
     if (localVideoRef.current && localVideoRef.current.srcObject) {
@@ -778,98 +814,6 @@ const VideoCall: React.FC = () => {
     });
   };
 
-  // Modify the useEffect for global error handling to be more aggressive
-  useEffect(() => {
-    // Global error handler for unhandled exceptions
-    const handleGlobalError = (event: ErrorEvent) => {
-      console.error('Global error caught:', event.error);
-      
-      // Prevent the blank screen by showing error UI
-      setError(`An unexpected error occurred: ${event.error?.message || 'Unknown error'}`);
-      setLoading(false);
-      
-      // Prevent default browser error handling
-      event.preventDefault();
-      
-      // Log additional details for debugging
-      console.log('Error details:', {
-        message: event.error?.message,
-        stack: event.error?.stack,
-        type: event.error?.name
-      });
-      
-      // Show toast with recovery option
-      toast({
-        title: "Application Error",
-        description: "The video call encountered a problem. Click 'Recover' to try again.",
-        action: (
-          <Button variant="outline" onClick={() => window.location.reload()}>
-            Recover
-          </Button>
-        ),
-        duration: 10000
-      });
-
-      // Force reload after multiple errors
-      if (window.sessionStorage.getItem('errorCount')) {
-        const count = parseInt(window.sessionStorage.getItem('errorCount') || '0') + 1;
-        window.sessionStorage.setItem('errorCount', count.toString());
-        
-        if (count > 2) {
-          // After 3 errors, force reload
-          console.log('Multiple errors detected, forcing page reload');
-          window.sessionStorage.removeItem('errorCount');
-          setTimeout(() => window.location.reload(), 3000);
-        }
-      } else {
-        window.sessionStorage.setItem('errorCount', '1');
-      }
-    };
-    
-    // Add global error handler
-    window.addEventListener('error', handleGlobalError);
-    window.addEventListener('unhandledrejection', (event) => {
-      console.error('Unhandled promise rejection:', event.reason);
-      handleGlobalError(new ErrorEvent('error', { error: event.reason }));
-    });
-    
-    // Check if the page is already in an error state on load
-    // This helps recover from a blank/black screen
-    const checkInitialErrorState = () => {
-      const mainContent = document.querySelector('main');
-      if (!mainContent || mainContent.children.length === 0) {
-        console.log('Detected blank page state, attempting recovery');
-        setError('Application is in an error state. Please try refreshing.');
-        setLoading(false);
-      }
-    };
-    
-    // Run the check after a short delay
-    const checkTimer = setTimeout(checkInitialErrorState, 3000);
-    
-    // Add a periodic check to detect frozen UI
-    const periodicCheck = setInterval(() => {
-      const now = Date.now();
-      const lastUpdate = parseInt(window.sessionStorage.getItem('lastUiUpdate') || '0');
-      
-      // If UI hasn't updated in 10 seconds, consider it frozen
-      if (lastUpdate && now - lastUpdate > 10000) {
-        console.log('UI appears frozen, attempting recovery');
-        window.sessionStorage.setItem('lastUiUpdate', now.toString());
-        setError('Application appears to be frozen. Please try refreshing.');
-      } else {
-        window.sessionStorage.setItem('lastUiUpdate', now.toString());
-      }
-    }, 5000);
-    
-    return () => {
-      window.removeEventListener('error', handleGlobalError);
-      window.removeEventListener('unhandledrejection', handleGlobalError as any);
-      clearTimeout(checkTimer);
-      clearInterval(periodicCheck);
-    };
-  }, [toast]);
-
   if (loading) {
     return (
       <div className="w-full h-screen flex items-center justify-center">
@@ -883,224 +827,226 @@ const VideoCall: React.FC = () => {
 
   return (
     <VideoCallErrorBoundary>
-      <StrictMode>
-        <div className="flex flex-col min-h-screen bg-gray-50">
-          {/* Header */}
-          <header className="bg-white shadow-sm p-4">
-            <div className="max-w-7xl mx-auto flex justify-between items-center">
-              <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
-              <div className="flex items-center gap-2">
-                <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
-                  {callStatus === 'connected' ? 'Connected' : 
-                   callStatus === 'connecting' ? 'Connecting...' : 
-                   callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
+      <div className="flex flex-col min-h-screen bg-gray-50">
+        {/* Header */}
+        <header className="bg-white shadow-sm p-4">
+          <div className="max-w-7xl mx-auto flex justify-between items-center">
+            <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
+            <div className="flex items-center gap-2">
+              <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
+                {callStatus === 'connected' ? 'Connected' : 
+                 callStatus === 'connecting' ? 'Connecting...' : 
+                 callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
+              </Badge>
+              {callStatus === 'connected' && (
+                <Badge variant="outline" className="font-mono">
+                  <Clock className="w-3 h-3 mr-1" />
+                  {new Date(callDuration * 1000).toISOString().substr(11, 8)}
                 </Badge>
-                {callStatus === 'connected' && (
-                  <Badge variant="outline" className="font-mono">
-                    <Clock className="w-3 h-3 mr-1" />
-                    {new Date(callDuration * 1000).toISOString().substr(11, 8)}
-                  </Badge>
-                )}
+              )}
+            </div>
+          </div>
+        </header>
+
+        {/* Main content */}
+        <main className="flex-grow p-4 relative">
+          {loading ? (
+            <div className="flex justify-center items-center h-full">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+            </div>
+          ) : error && !refreshingConnection ? (
+            <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
+              <div className="text-red-500 mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
+              <p className="text-gray-600 mb-4">{error}</p>
+              <div className="flex justify-center gap-4">
+                <Button onClick={handleManualReconnect}>
+                  Try Again
+                </Button>
+                <Button variant="outline" onClick={endCall}>
+                  End Call
+                </Button>
+                <Button variant="secondary" onClick={() => window.location.reload()}>
+                  Reload Page
+                </Button>
               </div>
             </div>
-          </header>
-
-          {/* Main content */}
-          <main className="flex-grow p-4 relative">
-            {loading ? (
-              <div className="flex justify-center items-center h-full">
-                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
-              </div>
-            ) : error && !refreshingConnection ? (
-              <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
-                <div className="text-red-500 mb-4">
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
-                <p className="text-gray-600 mb-4">{error}</p>
-                <div className="flex justify-center gap-4">
-                  <Button onClick={handleManualReconnect}>
-                    Try Again
-                  </Button>
-                  <Button variant="outline" onClick={endCall}>
-                    End Call
-                  </Button>
-                  <Button variant="secondary" onClick={() => window.location.reload()}>
-                    Reload Page
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
-                {/* Main video area */}
-                <div className="flex-1 relative overflow-hidden" onClick={handleManualPlay}>
-                  {/* Remote video (or waiting screen) */}
-                  <div className="w-full h-full relative">
-                    {/* Use the simplified video component */}
-                    <SafeVideoElement 
-                      videoRef={remoteVideoRef}
-                      className={`w-full h-full object-cover ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`}
-                    />
-                    
-                    {/* Waiting overlay when no remote video */}
-                    {(callStatus !== 'disconnected' && isWaitingForParticipant()) && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
-                        <div className="text-center space-y-4">
-                          <h2 className="text-2xl font-bold">Waiting for {remoteUserName}</h2>
-                          <p>The consultation will begin when they join</p>
-                          <div className="animate-pulse mt-8">
-                            <Phone className="h-16 w-16 mx-auto text-green-500" />
+          ) : (
+            <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
+              {/* Main video area */}
+              <div className="flex-1 relative overflow-hidden" onClick={handleManualPlay}>
+                {/* Remote video (or waiting screen) */}
+                <div className="w-full h-full relative">
+                  {/* Use plain HTML video elements to avoid React's rendering cycle */}
+                  <video
+                    ref={remoteVideoRef}
+                    className={`w-full h-full object-cover ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`}
+                    autoPlay
+                    playsInline
+                  />
+                  
+                  {/* Waiting overlay when no remote video */}
+                  {(callStatus !== 'disconnected' && isWaitingForParticipant()) && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
+                      <div className="text-center space-y-4">
+                        <h2 className="text-2xl font-bold">Waiting for {remoteUserName}</h2>
+                        <p>The consultation will begin when they join</p>
+                        <div className="animate-pulse mt-8">
+                          <Phone className="h-16 w-16 mx-auto text-green-500" />
+                        </div>
+                        {connectionAttempts > 0 && (
+                          <div className="text-sm text-gray-400">
+                            Connection attempts: {connectionAttempts}
                           </div>
-                          {connectionAttempts > 0 && (
-                            <div className="text-sm text-gray-400">
-                              Connection attempts: {connectionAttempts}
-                            </div>
-                          )}
-                          {refreshingConnection && (
-                            <div className="text-sm text-blue-400 animate-pulse">
-                              Refreshing connection...
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                    
-                    {/* Disconnected overlay */}
-                    {callStatus === 'disconnected' && (
-                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
-                        <div className="text-center space-y-4">
-                          <h2 className="text-2xl font-bold">Call Ended</h2>
-                          <p>{remoteUserName} has left the consultation</p>
-                          <Button 
-                            variant="outline" 
-                            className="mt-4"
-                            onClick={() => navigate('/')}
-                          >
-                            Return to Home
-                          </Button>
-                          <Button 
-                            variant="outline" 
-                            className="mt-4"
-                            onClick={handleManualReconnect}
-                          >
-                            Try to Reconnect
-                          </Button>
-                        </div>
-                      </div>
-                    )}
-                    
-                    {/* Local video (PIP) */}
-                    <div className="absolute bottom-4 right-4 w-1/4 max-w-[200px] h-auto aspect-video rounded-lg overflow-hidden border-2 border-white">
-                      {/* Use the simplified video component */}
-                      <SafeVideoElement
-                        videoRef={localVideoRef}
-                        className="w-full h-full object-cover"
-                        muted={true}
-                      />
-                      
-                      {/* Video disabled indicator */}
-                      {!videoEnabled && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70">
-                          <VideoOff className="text-white h-8 w-8" />
-                        </div>
-                      )}
-                    </div>
-                    
-                    {/* Debug button - only in development */}
-                    <button
-                      onClick={debugVideoElements}
-                      className="absolute top-2 right-2 bg-gray-800 text-white text-xs px-2 py-1 rounded opacity-50 hover:opacity-100"
-                    >
-                      Debug
-                    </button>
-                    
-                    {/* Participant status indicators */}
-                    <div className="absolute top-2 left-2 flex flex-col gap-1">
-                      {doctorJoined && (
-                        <Badge variant="default" className="bg-green-600">Doctor Connected</Badge>
-                      )}
-                      {patientJoined && (
-                        <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
-                      )}
-                      {connectionAttempts > 0 && (
-                        <Badge variant="outline" className="bg-blue-600 bg-opacity-50">Attempt #{connectionAttempts}</Badge>
-                      )}
-                    </div>
-                    
-                    {/* Error message */}
-                    {error && (
-                      <div className="absolute top-4 left-0 right-0 mx-auto max-w-sm bg-red-500 text-white p-2 rounded text-center">
-                        {error}
-                      </div>
-                    )}
-                    
-                    {/* Manual reconnect button when there are issues but not while actively reconnecting */}
-                    {error && !refreshingConnection && (
-                      <div className="absolute bottom-20 left-0 right-0 mx-auto text-center">
-                        <Button 
-                          variant="default"
-                          className="bg-blue-600"
-                          onClick={handleManualReconnect}
-                        >
-                          Refresh Connection
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                
-                {/* Call controls */}
-                <div className="p-4 bg-gray-900">
-                  <Card className="p-4">
-                    <div className="flex justify-between items-center">
-                      <div>
-                        <h2 className="font-semibold">{consultation?.doctor_name || 'Doctor'}</h2>
-                        <div className="text-sm text-gray-500">Consultation with {consultation?.patient_name || 'Patient'}</div>
-                        
-                        {callStatus === 'connected' && (
-                          <div className="flex items-center space-x-2 text-sm">
-                            <Clock className="h-4 w-4 text-green-600" />
-                            <span className="font-mono text-green-600">{formatDuration(callDuration)}</span>
-                            <Badge variant="default" className="bg-green-600">Live</Badge>
+                        )}
+                        {refreshingConnection && (
+                          <div className="text-sm text-blue-400 animate-pulse">
+                            Refreshing connection...
                           </div>
                         )}
                       </div>
-
-                      <div className="flex space-x-2">
+                    </div>
+                  )}
+                  
+                  {/* Disconnected overlay */}
+                  {callStatus === 'disconnected' && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
+                      <div className="text-center space-y-4">
+                        <h2 className="text-2xl font-bold">Call Ended</h2>
+                        <p>{remoteUserName} has left the consultation</p>
                         <Button 
-                          variant={videoEnabled ? "default" : "destructive"}
-                          size="icon" 
-                          onClick={toggleVideo}
+                          variant="outline" 
+                          className="mt-4"
+                          onClick={() => navigate('/')}
                         >
-                          {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
+                          Return to Home
                         </Button>
-                        
                         <Button 
-                          variant={audioEnabled ? "default" : "destructive"}
-                          size="icon" 
-                          onClick={toggleAudio}
+                          variant="outline" 
+                          className="mt-4"
+                          onClick={handleManualReconnect}
                         >
-                          {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
-                        </Button>
-                        
-                        <Button 
-                          variant="destructive"
-                          size="icon" 
-                          onClick={endCall}
-                        >
-                          <PhoneOff className="h-4 w-4" />
+                          Try to Reconnect
                         </Button>
                       </div>
                     </div>
-                  </Card>
+                  )}
+                  
+                  {/* Local video (PIP) */}
+                  <div className="absolute bottom-4 right-4 w-1/4 max-w-[200px] h-auto aspect-video rounded-lg overflow-hidden border-2 border-white">
+                    {/* Use plain HTML video element */}
+                    <video
+                      ref={localVideoRef}
+                      className="w-full h-full object-cover"
+                      autoPlay
+                      playsInline
+                      muted
+                    />
+                    
+                    {/* Video disabled indicator */}
+                    {!videoEnabled && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70">
+                        <VideoOff className="text-white h-8 w-8" />
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Debug button - only in development */}
+                  <button
+                    onClick={debugVideoElements}
+                    className="absolute top-2 right-2 bg-gray-800 text-white text-xs px-2 py-1 rounded opacity-50 hover:opacity-100"
+                  >
+                    Debug
+                  </button>
+                  
+                  {/* Participant status indicators */}
+                  <div className="absolute top-2 left-2 flex flex-col gap-1">
+                    {doctorJoined && (
+                      <Badge variant="default" className="bg-green-600">Doctor Connected</Badge>
+                    )}
+                    {patientJoined && (
+                      <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
+                    )}
+                    {connectionAttempts > 0 && (
+                      <Badge variant="outline" className="bg-blue-600 bg-opacity-50">Attempt #{connectionAttempts}</Badge>
+                    )}
+                  </div>
+                  
+                  {/* Error message */}
+                  {error && (
+                    <div className="absolute top-4 left-0 right-0 mx-auto max-w-sm bg-red-500 text-white p-2 rounded text-center">
+                      {error}
+                    </div>
+                  )}
+                  
+                  {/* Manual reconnect button when there are issues but not while actively reconnecting */}
+                  {error && !refreshingConnection && (
+                    <div className="absolute bottom-20 left-0 right-0 mx-auto text-center">
+                      <Button 
+                        variant="default"
+                        className="bg-blue-600"
+                        onClick={handleManualReconnect}
+                      >
+                        Refresh Connection
+                      </Button>
+                    </div>
+                  )}
                 </div>
               </div>
-            )}
-          </main>
-        </div>
-      </StrictMode>
+              
+              {/* Call controls */}
+              <div className="p-4 bg-gray-900">
+                <Card className="p-4">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <h2 className="font-semibold">{consultation?.doctor_name || 'Doctor'}</h2>
+                      <div className="text-sm text-gray-500">Consultation with {consultation?.patient_name || 'Patient'}</div>
+                      
+                      {callStatus === 'connected' && (
+                        <div className="flex items-center space-x-2 text-sm">
+                          <Clock className="h-4 w-4 text-green-600" />
+                          <span className="font-mono text-green-600">{formatDuration(callDuration)}</span>
+                          <Badge variant="default" className="bg-green-600">Live</Badge>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex space-x-2">
+                      <Button 
+                        variant={videoEnabled ? "default" : "destructive"}
+                        size="icon" 
+                        onClick={toggleVideo}
+                      >
+                        {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
+                      </Button>
+                      
+                      <Button 
+                        variant={audioEnabled ? "default" : "destructive"}
+                        size="icon" 
+                        onClick={toggleAudio}
+                      >
+                        {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
+                      </Button>
+                      
+                      <Button 
+                        variant="destructive"
+                        size="icon" 
+                        onClick={endCall}
+                      >
+                        <PhoneOff className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
     </VideoCallErrorBoundary>
   );
 };

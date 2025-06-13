@@ -236,176 +236,231 @@ class WebRTCCall {
       }
       
       // FIXED: Create RTCPeerConnection AFTER getting media to avoid issues
-      this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
-      console.log('Created peer connection with config:', PEER_CONFIG);
+      try {
+        this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
+        console.log('Created peer connection with config:', PEER_CONFIG);
+      } catch (peerError) {
+        console.error('Failed to create peer connection:', peerError);
+        throw new Error('Failed to create connection: ' + (peerError instanceof Error ? peerError.message : 'Unknown error'));
+      }
       
       // FIXED: Add local tracks to peer connection immediately after creating it
       if (this.localStream && this.peerConnection) {
-        this.localStream.getTracks().forEach(track => {
-          console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
-          if (this.peerConnection && this.localStream) {
-            try {
-              const sender = this.peerConnection.addTrack(track, this.localStream);
-              console.log('Added track to peer connection with sender:', sender.track?.id);
-            } catch (e) {
-              console.error('Error adding track to peer connection:', e);
+        try {
+          this.localStream.getTracks().forEach(track => {
+            console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
+            if (this.peerConnection && this.localStream) {
+              try {
+                const sender = this.peerConnection.addTrack(track, this.localStream);
+                console.log('Added track to peer connection with sender:', sender.track?.id);
+              } catch (e) {
+                console.error('Error adding track to peer connection:', e);
+                // Continue despite error - don't throw here
+              }
             }
-          }
-        });
+          });
+        } catch (trackError) {
+          console.error('Error adding tracks to peer connection:', trackError);
+          // Continue despite error - we'll try to establish connection anyway
+        }
       } else {
         console.error('No local stream or peer connection available');
       }
       
       // Handle ICE candidates
-      this.peerConnection.onicecandidate = event => {
-        if (event.candidate) {
-          console.log('Generated ICE candidate:', event.candidate);
-          this.sendSignal({
-            type: 'candidate',
-            candidate: event.candidate
-          });
-        } else {
-          console.log('All ICE candidates have been generated');
-        }
-      };
-      
-      // Handle ICE gathering state change
-      this.peerConnection.onicegatheringstatechange = () => {
-        console.log('ICE gathering state:', this.peerConnection?.iceGatheringState);
-      };
-      
-      // Handle ICE connection state changes
-      this.peerConnection.oniceconnectionstatechange = () => {
-        console.log('ICE connection state:', this.peerConnection?.iceConnectionState);
-        
-        if (this.peerConnection?.iceConnectionState === 'connected' || 
-            this.peerConnection?.iceConnectionState === 'completed') {
-          if (!this.isConnected) {
-            console.log('ICE connection established');
-            this.isConnected = true;
-            this.onPeerConnectedCallback?.();
-            
-            // Reset reconnection attempts on successful connection
-            this.reconnectAttempts = 0;
-            
-            // Force-check if we have remote tracks now
-            if (this.remoteStream && this.remoteStream.getTracks().length > 0) {
-              console.log('We have remote tracks after connection!');
-              this.hasReceivedRemoteTrack = true;
-              if (this.onRemoteStreamCallback) {
-                this.onRemoteStreamCallback(this.remoteStream);
-              }
-            } else {
-              console.log('No remote tracks yet after connection');
+      if (this.peerConnection) {
+        this.peerConnection.onicecandidate = event => {
+          if (event.candidate) {
+            console.log('Generated ICE candidate:', event.candidate);
+            try {
+              this.sendSignal({
+                type: 'candidate',
+                candidate: event.candidate
+              });
+            } catch (e) {
+              console.error('Error sending ICE candidate:', e);
+              // Don't throw, just log
             }
+          } else {
+            console.log('All ICE candidates have been generated');
           }
-        } else if (this.peerConnection?.iceConnectionState === 'disconnected') {
-          console.log('ICE connection disconnected, may recover...');
-          // Wait to see if it recovers before notifying disconnect
-          setTimeout(() => {
-            if (this.peerConnection?.iceConnectionState === 'disconnected') {
+        };
+        
+        // Handle ICE gathering state change
+        this.peerConnection.onicegatheringstatechange = () => {
+          console.log('ICE gathering state:', this.peerConnection?.iceGatheringState);
+        };
+        
+        // Handle ICE connection state changes
+        this.peerConnection.oniceconnectionstatechange = () => {
+          console.log('ICE connection state:', this.peerConnection?.iceConnectionState);
+          
+          if (this.peerConnection?.iceConnectionState === 'connected' || 
+              this.peerConnection?.iceConnectionState === 'completed') {
+            if (!this.isConnected) {
+              console.log('ICE connection established');
+              this.isConnected = true;
+              this.onPeerConnectedCallback?.();
+              
+              // Reset reconnection attempts on successful connection
+              this.reconnectAttempts = 0;
+              
+              // Force-check if we have remote tracks now
+              if (this.remoteStream && this.remoteStream.getTracks().length > 0) {
+                console.log('We have remote tracks after connection!');
+                this.hasReceivedRemoteTrack = true;
+                if (this.onRemoteStreamCallback) {
+                  try {
+                    this.onRemoteStreamCallback(this.remoteStream);
+                  } catch (e) {
+                    console.error('Error in remote stream callback:', e);
+                  }
+                }
+              } else {
+                console.log('No remote tracks yet after connection');
+              }
+            }
+          } else if (this.peerConnection?.iceConnectionState === 'disconnected') {
+            console.log('ICE connection disconnected, may recover...');
+            // Wait to see if it recovers before notifying disconnect
+            setTimeout(() => {
+              if (this.peerConnection?.iceConnectionState === 'disconnected') {
+                this.tryReconnect();
+              }
+            }, 2000);
+          } else if (this.peerConnection?.iceConnectionState === 'failed' || 
+                     this.peerConnection?.iceConnectionState === 'closed') {
+            console.log('ICE connection failed or closed');
+            if (this.isConnected) {
+              this.isConnected = false;
+              try {
+                this.onPeerDisconnectedCallback?.();
+              } catch (e) {
+                console.error('Error in peer disconnected callback:', e);
+              }
               this.tryReconnect();
             }
-          }, 2000);
-        } else if (this.peerConnection?.iceConnectionState === 'failed' || 
-                   this.peerConnection?.iceConnectionState === 'closed') {
-          console.log('ICE connection failed or closed');
-          if (this.isConnected) {
-            this.isConnected = false;
-            this.onPeerDisconnectedCallback?.();
-            this.tryReconnect();
           }
-        }
-      };
-      
-      // Listen for connection state changes too
-      this.peerConnection.onconnectionstatechange = () => {
-        console.log('Connection state:', this.peerConnection?.connectionState);
-        if (this.peerConnection?.connectionState === 'connected') {
-          console.log('Peer connection fully established');
-          // Reset reconnection attempts on successful connection
-          this.reconnectAttempts = 0;
-        }
-      };
-      
-      // Monitor signaling state
-      this.peerConnection.onsignalingstatechange = () => {
-        console.log('Signaling state:', this.peerConnection?.signalingState);
-      };
-      
-      // Handle remote tracks - CRITICAL FIX HERE
-      this.peerConnection.ontrack = event => {
-        console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled, 'readyState:', event.track.readyState);
-        this.hasReceivedRemoteTrack = true;
+        };
         
-        // Ensure the track is enabled
-        event.track.enabled = true;
+        // Listen for connection state changes too
+        this.peerConnection.onconnectionstatechange = () => {
+          console.log('Connection state:', this.peerConnection?.connectionState);
+          if (this.peerConnection?.connectionState === 'connected') {
+            console.log('Peer connection fully established');
+            // Reset reconnection attempts on successful connection
+            this.reconnectAttempts = 0;
+          }
+        };
         
-        // Add track to remote stream
-        if (!this.remoteStream) {
-          // If somehow remoteStream is null, create a new one
-          this.remoteStream = new MediaStream();
-        }
+        // Monitor signaling state
+        this.peerConnection.onsignalingstatechange = () => {
+          console.log('Signaling state:', this.peerConnection?.signalingState);
+        };
+        
+        // Handle remote tracks - CRITICAL FIX HERE
+        this.peerConnection.ontrack = event => {
+          console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled, 'readyState:', event.track.readyState);
+          this.hasReceivedRemoteTrack = true;
+          
+          try {
+            // Ensure the track is enabled
+            event.track.enabled = true;
+            
+            // Add track to remote stream
+            if (!this.remoteStream) {
+              // If somehow remoteStream is null, create a new one
+              this.remoteStream = new MediaStream();
+            }
 
-        // FIXED: Always use event.streams[0] if available, this is critical for proper stream handling
-        if (event.streams && event.streams.length > 0) {
-          console.log('Using event stream directly, has tracks:', event.streams[0].getTracks().length);
-          
-          // Debug log event stream tracks
-          event.streams[0].getTracks().forEach(track => {
-            console.log('Event stream track:', track.kind, track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
-            // Make sure the track is enabled
-            track.enabled = true;
-          });
-          
-          // FIXED: Replace remoteStream with the one from the event to maintain synchronization
-          this.remoteStream = event.streams[0];
-        } else {
-          // Fallback: manually add track if event.streams is not available
-          console.log('No event streams, manually adding track to remote stream');
-          this.remoteStream.addTrack(event.track);
-        }
-        
-        // Debug log remote stream
-        console.log('Remote stream now has tracks:', 
-                   this.remoteStream.getVideoTracks().length, 'video,', 
-                   this.remoteStream.getAudioTracks().length, 'audio');
-        
-        // FIXED: Always notify about the remote stream when we get a track
-        if (this.onRemoteStreamCallback) {
-          console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
-          this.onRemoteStreamCallback(this.remoteStream);
-        }
-        
-        // Ensure we mark as connected when we get tracks
-        if (!this.isConnected) {
-          console.log('Track received, marking as connected');
-          this.isConnected = true;
-          this.onPeerConnectedCallback?.();
-        }
-      };
+            // FIXED: Always use event.streams[0] if available, this is critical for proper stream handling
+            if (event.streams && event.streams.length > 0) {
+              console.log('Using event stream directly, has tracks:', event.streams[0].getTracks().length);
+              
+              // Debug log event stream tracks
+              event.streams[0].getTracks().forEach(track => {
+                console.log('Event stream track:', track.kind, track.id, 'enabled:', track.enabled, 'readyState:', track.readyState);
+                // Make sure the track is enabled
+                track.enabled = true;
+              });
+              
+              // FIXED: Replace remoteStream with the one from the event to maintain synchronization
+              this.remoteStream = event.streams[0];
+            } else {
+              // Fallback: manually add track if event.streams is not available
+              console.log('No event streams, manually adding track to remote stream');
+              this.remoteStream.addTrack(event.track);
+            }
+            
+            // Debug log remote stream
+            console.log('Remote stream now has tracks:', 
+                       this.remoteStream.getVideoTracks().length, 'video,', 
+                       this.remoteStream.getAudioTracks().length, 'audio');
+            
+            // FIXED: Always notify about the remote stream when we get a track
+            if (this.onRemoteStreamCallback) {
+              console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
+              try {
+                this.onRemoteStreamCallback(this.remoteStream);
+              } catch (e) {
+                console.error('Error in remote stream callback:', e);
+              }
+            }
+            
+            // Ensure we mark as connected when we get tracks
+            if (!this.isConnected) {
+              console.log('Track received, marking as connected');
+              this.isConnected = true;
+              try {
+                this.onPeerConnectedCallback?.();
+              } catch (e) {
+                console.error('Error in peer connected callback:', e);
+              }
+            }
+          } catch (trackError) {
+            console.error('Error handling remote track:', trackError);
+            // Don't rethrow - just log and continue
+          }
+        };
+      }
       
       // Share the local stream with the component
       if (this.localStream && this.onLocalStreamCallback) {
         console.log('Calling onLocalStream callback with stream:', this.localStream.id);
-        this.onLocalStreamCallback(this.localStream);
+        try {
+          this.onLocalStreamCallback(this.localStream);
+        } catch (e) {
+          console.error('Error in local stream callback:', e);
+        }
       }
       
       // Join the WebRTC room using WebSockets
-      await this.joinRoom();
+      try {
+        await this.joinRoom();
+      } catch (joinError) {
+        console.error('Error joining room:', joinError);
+        // Continue despite error - we'll try to establish connection anyway
+      }
       
       // Create offer after a short delay if we don't establish connection
       // This helps initiate the connection, especially in direct mode
       setTimeout(() => {
         if (!this.isConnected && this.peerConnection) {
           console.log('No connection yet, creating offer...');
-          this.createAndSendOffer();
+          this.createAndSendOffer().catch(e => {
+            console.error('Error creating offer:', e);
+            // Don't throw - just log
+          });
         }
       }, 1000);
       
     } catch (error) {
       console.error('Error initializing WebRTC call:', error);
-      this.onErrorCallback?.(error instanceof Error ? error : new Error(String(error)));
+      try {
+        this.onErrorCallback?.(error instanceof Error ? error : new Error(String(error)));
+      } catch (callbackError) {
+        console.error('Error in error callback:', callbackError);
+      }
       throw error;
     }
   }
@@ -892,91 +947,76 @@ class WebRTCCall {
   }
   
   /**
-   * Handle an incoming signaling message
+   * Handle received signaling message
    */
   private async handleSignalingMessage(message: any): Promise<void> {
     try {
-      if (!this.peerConnection) return;
+      if (!this.peerConnection) {
+        console.error('No peer connection available to handle message');
+        return;
+      }
       
       const signal = message.signal;
-      console.log('Handling signal type:', signal.type);
+      console.log('Received signal type:', signal.type);
       
-      // FIXED: Handle signaling with better error handling and state management
-      if (signal.type === 'offer') {
-        console.log('Received offer from remote peer');
-        
-        // Check if we can set the remote description in current state
-        const signalingState = this.peerConnection.signalingState;
-        console.log('Current signaling state before processing offer:', signalingState);
-        
-        try {
-          // If we're not in stable state, reset the connection
-          if (signalingState !== 'stable') {
-            console.log('Resetting connection before processing offer...');
-            await this.peerConnection.setLocalDescription({type: 'rollback'} as RTCSessionDescriptionInit);
+      switch (signal.type) {
+        case 'offer':
+          console.log('Received offer from peer');
+          
+          try {
+            // Set remote description from the offer
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal));
+            
+            // Create and send answer
+            console.log('Creating answer...');
+            const answer = await this.peerConnection.createAnswer();
+            
+            // Set local description
+            await this.peerConnection.setLocalDescription(answer);
+            
+            // Send answer to peer
+            console.log('Sending answer to peer');
+            this.sendSignal({
+              type: 'answer',
+              sdp: answer.sdp
+            });
+          } catch (error) {
+            console.error('Error handling offer:', error);
+            this.onErrorCallback?.(new Error(`Error handling offer: ${error instanceof Error ? error.message : String(error)}`));
           }
+          break;
           
-          // Set remote description from offer
-          await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-          console.log('Set remote description from offer');
-          
-          // Create and send answer
-          const answer = await this.peerConnection.createAnswer();
-          await this.peerConnection.setLocalDescription(answer);
-          console.log('Created and set local description from answer');
-          
-          this.sendSignal({
-            type: 'answer',
-            sdp: this.peerConnection.localDescription
-          });
-          console.log('Sent answer via WebSocket');
-        } catch (e) {
-          console.error('Error handling offer:', e);
-          // Try to recover by restarting ICE
-          this.tryReconnect();
-        }
-        
-      } else if (signal.type === 'answer') {
-        console.log('Received answer from remote peer');
-        
-        try {
-          // Check if we can set the remote description in current state
-          const signalingState = this.peerConnection.signalingState;
-          console.log('Current signaling state before processing answer:', signalingState);
-          
-          // Only process answer if we're in have-local-offer state
-          if (signalingState === 'have-local-offer') {
-            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-            console.log('Set remote description from answer');
-          } else {
-            console.log('Ignoring answer - peer connection not in have-local-offer state');
+        case 'answer':
+          console.log('Received answer from peer');
+          try {
+            // Set remote description from the answer
+            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal));
+          } catch (error) {
+            console.error('Error setting remote description from answer:', error);
+            this.onErrorCallback?.(new Error(`Error handling answer: ${error instanceof Error ? error.message : String(error)}`));
           }
-        } catch (e) {
-          console.error('Error handling answer:', e);
-          this.tryReconnect();
-        }
-        
-      } else if (signal.type === 'candidate') {
-        console.log('Received ICE candidate from remote peer');
-        
-        try {
-          // Only add ice candidate if remote description has been set
-          if (this.peerConnection.remoteDescription) {
+          break;
+          
+        case 'candidate':
+          console.log('Received ICE candidate');
+          try {
+            // Add the ICE candidate to the connection
             if (signal.candidate) {
               await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
-              console.log('Added ICE candidate');
             }
-          } else {
-            console.log('Ignoring ICE candidate - no remote description set yet');
+          } catch (error) {
+            console.error('Error adding ICE candidate:', error);
+            // Don't trigger error callback for individual ICE candidate failures
+            // as they're expected in some network conditions
           }
-        } catch (e) {
-          console.error('Error handling ICE candidate:', e);
-        }
-      } else {
-        console.warn('Unknown signal type:', signal.type);
+          break;
+          
+        default:
+          console.warn('Unknown signal type:', signal.type);
       }
     } catch (error) {
       console.error('Error handling signaling message:', error);
+      this.onErrorCallback?.(new Error(`Error handling signal: ${error instanceof Error ? error.message : String(error)}`));
     }
   }
   

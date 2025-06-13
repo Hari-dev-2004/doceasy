@@ -30,12 +30,17 @@ const VideoCall: React.FC = () => {
   const [lastConnectAttempt, setLastConnectAttempt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [remoteUserName, setRemoteUserName] = useState<string>('');
+  const [doctorJoined, setDoctorJoined] = useState(false);
+  const [patientJoined, setPatientJoined] = useState(false);
+  const [currentRole, setCurrentRole] = useState<string>('');
+  const [roomId, setRoomId] = useState<string>('');
 
   // WebRTC
   const webrtcRef = useRef<WebRTCCall | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const roomStatusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Load user data and fetch consultation in one effect
   useEffect(() => {
@@ -52,6 +57,10 @@ const VideoCall: React.FC = () => {
       
       try {
         setLoading(true);
+        
+        // Store current user role
+        const userRole = localStorage.getItem('userRole');
+        setCurrentRole(userRole || '');
         
         // Get consultation data
         const token = localStorage.getItem('token');
@@ -84,6 +93,7 @@ const VideoCall: React.FC = () => {
         
         if (consultationData && consultationData.video_call_id) {
           setConsultation(consultationData);
+          setRoomId(consultationData.video_call_id);
           // Simplified security verification - if we can fetch the appointment, user is authorized
           setSecurityVerified(true);
 
@@ -118,6 +128,45 @@ const VideoCall: React.FC = () => {
     fetchConsultation();
   }, [appointmentId, navigate, toast]);
   
+  // Start polling for room status to check participant join status
+  useEffect(() => {
+    if (!appointmentId || !securityVerified) return;
+    
+    const pollRoomStatus = async () => {
+      try {
+        const token = localStorage.getItem('token');
+        if (!token) return;
+        
+        const response = await axios.get(
+          `${API_URL}/api/webrtc/rooms/${appointmentId}/status`, 
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        
+        const data = response.data;
+        if (data.has_active_call) {
+          // Update participant status
+          setDoctorJoined(data.doctor_joined);
+          setPatientJoined(data.patient_joined);
+        }
+      } catch (err) {
+        console.error('Error polling room status:', err);
+      }
+    };
+    
+    // Initial poll
+    pollRoomStatus();
+    
+    // Set up interval
+    roomStatusIntervalRef.current = setInterval(pollRoomStatus, 5000);
+    
+    // Clean up interval on unmount
+    return () => {
+      if (roomStatusIntervalRef.current) {
+        clearInterval(roomStatusIntervalRef.current);
+      }
+    };
+  }, [appointmentId, securityVerified]);
+  
   // Initialize WebRTC when consultation is loaded
   useEffect(() => {
     if (!securityVerified || !consultation?.video_call_id) return;
@@ -151,6 +200,14 @@ const VideoCall: React.FC = () => {
                   console.error('Error auto-playing local video:', e);
                 });
               };
+            }
+            
+            // Update joined status for current user
+            const userRole = localStorage.getItem('userRole');
+            if (userRole === 'doctor') {
+              setDoctorJoined(true);
+            } else if (userRole === 'patient') {
+              setPatientJoined(true);
             }
           },
           onRemoteStream: (stream) => {
@@ -193,6 +250,14 @@ const VideoCall: React.FC = () => {
               
               // FIXED: Set hasRemoteVideo based on active track state, not just presence
               setHasRemoteVideo(videoTracks.length > 0 && videoTracks.some(track => track.enabled));
+              
+              // When we receive a remote stream, the other participant has joined
+              const userRole = localStorage.getItem('userRole');
+              if (userRole === 'doctor') {
+                setPatientJoined(true);
+              } else {
+                setDoctorJoined(true);
+              }
             }
           },
           onPeerConnected: () => {
@@ -208,11 +273,28 @@ const VideoCall: React.FC = () => {
             durationTimerRef.current = setInterval(() => {
               setCallDuration(prev => prev + 1);
             }, 1000);
+            
+            // The remote peer has definitely joined if we're connected
+            const userRole = localStorage.getItem('userRole');
+            if (userRole === 'doctor') {
+              setPatientJoined(true);
+            } else {
+              setDoctorJoined(true);
+            }
           },
           onPeerDisconnected: () => {
             console.log('Peer disconnected');
             setCallStatus('disconnected');
             setHasRemoteVideo(false);
+            
+            // Update joined status for the other participant
+            const userRole = localStorage.getItem('userRole');
+            if (userRole === 'doctor') {
+              setPatientJoined(false);
+            } else {
+              setDoctorJoined(false);
+            }
+            
             // Stop timer
             if (durationTimerRef.current) {
               clearInterval(durationTimerRef.current);
@@ -344,6 +426,11 @@ const VideoCall: React.FC = () => {
       durationTimerRef.current = null;
     }
     
+    if (roomStatusIntervalRef.current) {
+      clearInterval(roomStatusIntervalRef.current);
+      roomStatusIntervalRef.current = null;
+    }
+    
     toast({
       title: "Call Ended",
       description: "Video consultation has ended"
@@ -393,6 +480,16 @@ const VideoCall: React.FC = () => {
     }
   };
   
+  // Determine if we should show waiting state based on who has joined
+  const isWaitingForParticipant = () => {
+    if (currentRole === 'doctor') {
+      return !patientJoined;
+    } else if (currentRole === 'patient') {
+      return !doctorJoined;
+    }
+    return true; // Default to waiting if role is unknown
+  };
+  
   // Log stream states for debugging
   const debugVideoElements = () => {
     if (localVideoRef.current) {
@@ -438,6 +535,16 @@ const VideoCall: React.FC = () => {
         remoteAudioTracks: webrtcCall.remoteStream?.getAudioTracks().length || 0,
       });
     }
+    
+    // Log room status
+    console.log('Room status:', {
+      roomId,
+      currentRole,
+      doctorJoined,
+      patientJoined,
+      callStatus,
+      appointmentId
+    });
   };
 
   if (loading) {
@@ -466,7 +573,7 @@ const VideoCall: React.FC = () => {
           />
           
           {/* Waiting overlay when no remote video */}
-          {(callStatus === 'waiting' || callStatus === 'connecting') && (
+          {(callStatus !== 'disconnected' && isWaitingForParticipant()) && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
               <div className="text-center space-y-4">
                 <h2 className="text-2xl font-bold">Waiting for {remoteUserName}</h2>
@@ -520,6 +627,16 @@ const VideoCall: React.FC = () => {
           >
             Debug
           </button>
+          
+          {/* Participant status indicators */}
+          <div className="absolute top-2 left-2 flex flex-col gap-1">
+            {doctorJoined && (
+              <Badge variant="default" className="bg-green-600">Doctor Connected</Badge>
+            )}
+            {patientJoined && (
+              <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
+            )}
+          </div>
           
           {/* Error message */}
           {error && (

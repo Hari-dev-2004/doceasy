@@ -356,6 +356,7 @@ class WebRTCCall {
         const timeoutId = setTimeout(() => {
           console.error('WebSocket connection timeout - using HTTP fallback');
           // Instead of rejecting, we'll continue and use HTTP fallbacks
+          this._setupHttpSignalingFallback();
           resolve();
         }, 10000);
         
@@ -369,14 +370,16 @@ class WebRTCCall {
         // Handle connection error
         this.socket.on('connect_error', (error) => {
           console.error('WebSocket connection error:', error);
-          // Don't reject, let the timeout handle it
-          // We'll continue and use HTTP fallbacks if needed
+          clearTimeout(timeoutId);
+          // Set up HTTP fallback immediately on connection error
+          this._setupHttpSignalingFallback();
+          resolve();
         });
       });
       
       // Authenticate with the WebSocket server
       // Only if we actually have a socket connection
-      if (this.socket.connected) {
+      if (this.socket && this.socket.connected) {
         await this.authenticateSocket();
         
         // Setup signal handlers
@@ -551,7 +554,7 @@ class WebRTCCall {
           setTimeout(() => {
             console.log('Room join via WebSocket timed out, trying HTTP fallback');
             this._joinRoomViaHttp().then(resolve).catch(reject);
-          }, 8000); // Shorter timeout before falling back
+          }, 5000); // Shorter timeout before falling back
         });
       } else {
         // Join using HTTP fallback
@@ -581,14 +584,38 @@ class WebRTCCall {
       const token = localStorage.getItem('token');
       if (!token) throw new Error('No authentication token found');
       
-      await axios.post(
-        `${API_URL}/api/webrtc/rooms/${this.roomId}/join`, 
-        { appointment_id: this.appointmentId },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      // Add retry logic
+      let attempts = 0;
+      const maxAttempts = 3;
       
-      console.log('Successfully joined room via HTTP');
-      return;
+      while (attempts < maxAttempts) {
+        try {
+          const response = await axios.post(
+            `${API_URL}/api/webrtc/rooms/${this.roomId}/join`, 
+            { appointment_id: this.appointmentId },
+            { 
+              headers: { Authorization: `Bearer ${token}` },
+              timeout: 10000 // 10 second timeout
+            }
+          );
+          
+          console.log('Successfully joined room via HTTP:', response.data);
+          this.userId = response.data.user_id;
+          return;
+        } catch (err) {
+          attempts++;
+          console.error(`HTTP room join error (attempt ${attempts}/${maxAttempts}):`, err);
+          
+          if (attempts >= maxAttempts) {
+            throw err; // Rethrow after max attempts
+          }
+          
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+        }
+      }
+      
+      throw new Error('Failed to join room after multiple attempts');
     } catch (error) {
       console.error('Error joining room via HTTP:', error);
       throw error;
@@ -789,10 +816,21 @@ class WebRTCCall {
         }
         
         // Send using HTTP
-        this._sendHttpSignal(signal);
+        this._sendHttpSignal(signal).catch(err => {
+          console.error('HTTP signal sending failed:', err);
+          // Store signals to retry later if needed
+          setTimeout(() => this._sendHttpSignal(signal), 2000);
+        });
       }
     } catch (error) {
       console.error('Error sending signal:', error);
+      
+      // Always try HTTP as backup even if there's an error
+      try {
+        this._sendHttpSignal(signal);
+      } catch (err) {
+        console.error('Backup HTTP signal send failed:', err);
+      }
     }
   }
   
@@ -896,6 +934,56 @@ class WebRTCCall {
   private _setupHttpSignalingFallback(): void {
     console.log('Setting up HTTP signaling fallback');
     
+    // Create a fake socket event handling system
+    if (!this.socket) {
+      // Create a minimal fake socket interface for compatibility
+      this.socket = {
+        connected: false,
+        emit: (event: string, data: any) => {
+          console.log(`Fake socket emit for event ${event}`);
+          if (event === 'webrtc_signal') {
+            this._sendHttpSignal(data.signal);
+          } else if (event === 'join_room') {
+            // Handle join room via HTTP
+            this._joinRoomViaHttp();
+          } else if (event === 'leave_room') {
+            // Handle leave room via HTTP
+            const token = localStorage.getItem('token');
+            if (token) {
+              axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/leave`, {}, {
+                headers: { Authorization: `Bearer ${token}` }
+              }).catch(err => console.error('Error leaving room via HTTP:', err));
+            }
+          }
+        },
+        on: (event: string, callback: any) => {
+          console.log(`Registering fake handler for ${event}`);
+          // Store handlers but they won't be called directly
+          return this;
+        },
+        once: (event: string, callback: any) => {
+          console.log(`Registering fake one-time handler for ${event}`);
+          // For authentication and other one-time events
+          if (event === 'authenticated') {
+            // Simulate authentication success after a delay
+            setTimeout(() => {
+              this.userId = localStorage.getItem('userId') || 'unknown';
+              callback({ user_id: this.userId });
+            }, 100);
+          }
+          return this;
+        },
+        connect: () => {
+          console.log('Fake socket connect called');
+          return this;
+        },
+        disconnect: () => {
+          console.log('Fake socket disconnect called');
+          return this;
+        },
+      } as any;
+    }
+    
     // Start polling for messages
     this._startHttpSignalingPolling();
   }
@@ -904,21 +992,37 @@ class WebRTCCall {
    * Start polling for signaling messages using HTTP
    */
   private _startHttpSignalingPolling(): void {
+    console.log('Starting HTTP polling for signaling messages');
+    
+    // Get initial messages
+    this._pollHttpSignals().then(messages => {
+      messages.forEach(message => {
+        this.handleSignalingMessage(message).catch(err => {
+          console.error('Error handling polled message:', err);
+        });
+      });
+    }).catch(err => {
+      console.error('Initial poll failed:', err);
+    });
+    
     // Poll for new messages every few seconds
     const pollInterval = setInterval(async () => {
-      if (!this.isConnected) {
-        // Stop polling if we disconnect
-        clearInterval(pollInterval);
-        return;
-      }
-      
       try {
-        // Send a keep-alive signal
-        await this._sendHttpSignal({
-          type: 'keepalive',
-          roomId: this.roomId,
-          timestamp: Date.now()
-        });
+        // Check if we should stop polling
+        if (this.peerConnection === null) {
+          console.log('Stopping HTTP polling - peer connection closed');
+          clearInterval(pollInterval);
+          return;
+        }
+        
+        // Send a keep-alive signal occasionally
+        if (Math.random() < 0.2) { // 20% chance each poll
+          await this._sendHttpSignal({
+            type: 'keepalive',
+            roomId: this.roomId,
+            timestamp: Date.now()
+          });
+        }
         
         // Poll for new messages
         const messages = await this._pollHttpSignals();
@@ -929,6 +1033,7 @@ class WebRTCCall {
         }
       } catch (err) {
         console.warn('HTTP signaling poll error:', err);
+        // Don't stop polling on error, just continue with the next interval
       }
     }, 2000);
   }
@@ -941,14 +1046,37 @@ class WebRTCCall {
       const token = localStorage.getItem('token');
       if (!token) return;
       
-      await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/signal`, {
-        signal: signal,
-        target_id: signal.target_id
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      // Add retry logic
+      let attempts = 0;
+      const maxAttempts = 3;
+      
+      while (attempts < maxAttempts) {
+        try {
+          await axios.post(`${API_URL}/api/webrtc/rooms/${this.roomId}/signal`, {
+            signal: signal,
+            target_id: signal.target_id
+          }, {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 10000 // 10 second timeout
+          });
+          
+          // Success, exit the retry loop
+          break;
+        } catch (err) {
+          attempts++;
+          console.error(`HTTP signal send error (attempt ${attempts}/${maxAttempts}):`, err);
+          
+          if (attempts >= maxAttempts) {
+            throw err; // Rethrow after max attempts
+          }
+          
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+        }
+      }
     } catch (err) {
-      console.error('HTTP signal send error:', err);
+      console.error('HTTP signal send error after all retries:', err);
+      throw err;
     }
   }
   
@@ -965,7 +1093,10 @@ class WebRTCCall {
       
       const response = await axios.get(
         `${API_URL}/api/webrtc/rooms/${this.roomId}/messages?since=${lastPoll}`, 
-        { headers: { Authorization: `Bearer ${token}` } }
+        { 
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 5000 // 5 second timeout
+        }
       );
       
       return response.data.messages || [];

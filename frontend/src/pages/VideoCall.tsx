@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, Suspense, lazy } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import axios from "axios";
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +17,81 @@ const CONNECTION_MANAGEMENT = {
   reconnectDelay: 2000,        // Delay before recreating WebRTC after errors (ms)
   participantCheckThreshold: 3 // How many status checks before triggering refresh
 };
+
+// Create a separate error boundary component
+class VideoCallErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    // Update state so the next render will show the fallback UI
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    // Log the error to an error reporting service
+    console.error("VideoCall component error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      // Fallback UI when an error occurs
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-100">
+          <div className="bg-white p-8 rounded-lg shadow-lg max-w-md w-full">
+            <div className="text-red-500 mb-4 flex justify-center">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                className="h-16 w-16"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                />
+              </svg>
+            </div>
+            <h1 className="text-2xl font-bold text-center text-gray-800 mb-4">
+              Video Call Error
+            </h1>
+            <p className="text-gray-600 mb-6 text-center">
+              {this.state.error?.message || "An unexpected error occurred in the video call component"}
+            </p>
+            <div className="flex justify-center">
+              <Button
+                onClick={() => {
+                  window.location.reload();
+                }}
+                className="mr-2"
+              >
+                Reload Page
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  window.location.href = "/";
+                }}
+              >
+                Go Home
+              </Button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 
 /**
  * VideoCall component for real-time WebRTC consultations
@@ -663,7 +738,7 @@ const VideoCall: React.FC = () => {
     });
   };
 
-  // Add a useEffect to handle global errors and recovery
+  // Modify the useEffect for global error handling to be more aggressive
   useEffect(() => {
     // Global error handler for unhandled exceptions
     const handleGlobalError = (event: ErrorEvent) => {
@@ -694,10 +769,29 @@ const VideoCall: React.FC = () => {
         ),
         duration: 10000
       });
+
+      // Force reload after multiple errors
+      if (window.sessionStorage.getItem('errorCount')) {
+        const count = parseInt(window.sessionStorage.getItem('errorCount') || '0') + 1;
+        window.sessionStorage.setItem('errorCount', count.toString());
+        
+        if (count > 2) {
+          // After 3 errors, force reload
+          console.log('Multiple errors detected, forcing page reload');
+          window.sessionStorage.removeItem('errorCount');
+          setTimeout(() => window.location.reload(), 3000);
+        }
+      } else {
+        window.sessionStorage.setItem('errorCount', '1');
+      }
     };
     
     // Add global error handler
     window.addEventListener('error', handleGlobalError);
+    window.addEventListener('unhandledrejection', (event) => {
+      console.error('Unhandled promise rejection:', event.reason);
+      handleGlobalError(new ErrorEvent('error', { error: event.reason }));
+    });
     
     // Check if the page is already in an error state on load
     // This helps recover from a blank/black screen
@@ -713,9 +807,26 @@ const VideoCall: React.FC = () => {
     // Run the check after a short delay
     const checkTimer = setTimeout(checkInitialErrorState, 3000);
     
+    // Add a periodic check to detect frozen UI
+    const periodicCheck = setInterval(() => {
+      const now = Date.now();
+      const lastUpdate = parseInt(window.sessionStorage.getItem('lastUiUpdate') || '0');
+      
+      // If UI hasn't updated in 10 seconds, consider it frozen
+      if (lastUpdate && now - lastUpdate > 10000) {
+        console.log('UI appears frozen, attempting recovery');
+        window.sessionStorage.setItem('lastUiUpdate', now.toString());
+        setError('Application appears to be frozen. Please try refreshing.');
+      } else {
+        window.sessionStorage.setItem('lastUiUpdate', now.toString());
+      }
+    }, 5000);
+    
     return () => {
       window.removeEventListener('error', handleGlobalError);
+      window.removeEventListener('unhandledrejection', handleGlobalError as any);
       clearTimeout(checkTimer);
+      clearInterval(periodicCheck);
     };
   }, [toast]);
 
@@ -731,225 +842,233 @@ const VideoCall: React.FC = () => {
   }
 
   return (
-    <div className="flex flex-col min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow-sm p-4">
-        <div className="max-w-7xl mx-auto flex justify-between items-center">
-          <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
-          <div className="flex items-center gap-2">
-            <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
-              {callStatus === 'connected' ? 'Connected' : 
-               callStatus === 'connecting' ? 'Connecting...' : 
-               callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
-            </Badge>
-            {callStatus === 'connected' && (
-              <Badge variant="outline" className="font-mono">
-                <Clock className="w-3 h-3 mr-1" />
-                {new Date(callDuration * 1000).toISOString().substr(11, 8)}
+    <VideoCallErrorBoundary>
+      <div className="flex flex-col min-h-screen bg-gray-50">
+        {/* Header */}
+        <header className="bg-white shadow-sm p-4">
+          <div className="max-w-7xl mx-auto flex justify-between items-center">
+            <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
+            <div className="flex items-center gap-2">
+              <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
+                {callStatus === 'connected' ? 'Connected' : 
+                 callStatus === 'connecting' ? 'Connecting...' : 
+                 callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
               </Badge>
-            )}
+              {callStatus === 'connected' && (
+                <Badge variant="outline" className="font-mono">
+                  <Clock className="w-3 h-3 mr-1" />
+                  {new Date(callDuration * 1000).toISOString().substr(11, 8)}
+                </Badge>
+              )}
+            </div>
           </div>
-        </div>
-      </header>
+        </header>
 
-      {/* Main content */}
-      <main className="flex-grow p-4 relative">
-        {loading ? (
-          <div className="flex justify-center items-center h-full">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
-          </div>
-        ) : error && !refreshingConnection ? (
-          <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
-            <div className="text-red-500 mb-4">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
+        {/* Main content */}
+        <main className="flex-grow p-4 relative">
+          {loading ? (
+            <div className="flex justify-center items-center h-full">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
             </div>
-            <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
-            <p className="text-gray-600 mb-4">{error}</p>
-            <div className="flex justify-center gap-4">
-              <Button onClick={handleManualReconnect}>
-                Try Again
-              </Button>
-              <Button variant="outline" onClick={endCall}>
-                End Call
-              </Button>
-              <Button variant="secondary" onClick={() => window.location.reload()}>
-                Reload Page
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
-            {/* Main video area */}
-            <div className="flex-1 relative overflow-hidden" onClick={handleManualPlay}>
-              {/* Remote video (or waiting screen) */}
-              <div className="w-full h-full relative">
-                {/* Actual video element */}
-                <video
-                  ref={remoteVideoRef}
-                  className={`w-full h-full object-cover ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`}
-                  autoPlay
-                  playsInline
-                />
-                
-                {/* Waiting overlay when no remote video */}
-                {(callStatus !== 'disconnected' && isWaitingForParticipant()) && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
-                    <div className="text-center space-y-4">
-                      <h2 className="text-2xl font-bold">Waiting for {remoteUserName}</h2>
-                      <p>The consultation will begin when they join</p>
-                      <div className="animate-pulse mt-8">
-                        <Phone className="h-16 w-16 mx-auto text-green-500" />
-                      </div>
-                      {connectionAttempts > 0 && (
-                        <div className="text-sm text-gray-400">
-                          Connection attempts: {connectionAttempts}
-                        </div>
-                      )}
-                      {refreshingConnection && (
-                        <div className="text-sm text-blue-400 animate-pulse">
-                          Refreshing connection...
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-                
-                {/* Disconnected overlay */}
-                {callStatus === 'disconnected' && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
-                    <div className="text-center space-y-4">
-                      <h2 className="text-2xl font-bold">Call Ended</h2>
-                      <p>{remoteUserName} has left the consultation</p>
-                      <Button 
-                        variant="outline" 
-                        className="mt-4"
-                        onClick={() => navigate('/')}
-                      >
-                        Return to Home
-                      </Button>
-                      <Button 
-                        variant="outline" 
-                        className="mt-4"
-                        onClick={handleManualReconnect}
-                      >
-                        Try to Reconnect
-                      </Button>
-                    </div>
-                  </div>
-                )}
-                
-                {/* Local video (PIP) */}
-                <div className="absolute bottom-4 right-4 w-1/4 max-w-[200px] h-auto aspect-video rounded-lg overflow-hidden border-2 border-white">
-                  <video
-                    ref={localVideoRef}
-                    className="w-full h-full object-cover"
-                    autoPlay
-                    playsInline
-                    muted // Always mute local video to prevent feedback
-                  />
-                  
-                  {/* Video disabled indicator */}
-                  {!videoEnabled && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70">
-                      <VideoOff className="text-white h-8 w-8" />
-                    </div>
-                  )}
-                </div>
-                
-                {/* Debug button - only in development */}
-                <button
-                  onClick={debugVideoElements}
-                  className="absolute top-2 right-2 bg-gray-800 text-white text-xs px-2 py-1 rounded opacity-50 hover:opacity-100"
-                >
-                  Debug
-                </button>
-                
-                {/* Participant status indicators */}
-                <div className="absolute top-2 left-2 flex flex-col gap-1">
-                  {doctorJoined && (
-                    <Badge variant="default" className="bg-green-600">Doctor Connected</Badge>
-                  )}
-                  {patientJoined && (
-                    <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
-                  )}
-                  {connectionAttempts > 0 && (
-                    <Badge variant="outline" className="bg-blue-600 bg-opacity-50">Attempt #{connectionAttempts}</Badge>
-                  )}
-                </div>
-                
-                {/* Error message */}
-                {error && (
-                  <div className="absolute top-4 left-0 right-0 mx-auto max-w-sm bg-red-500 text-white p-2 rounded text-center">
-                    {error}
-                  </div>
-                )}
-                
-                {/* Manual reconnect button when there are issues but not while actively reconnecting */}
-                {error && !refreshingConnection && (
-                  <div className="absolute bottom-20 left-0 right-0 mx-auto text-center">
-                    <Button 
-                      variant="default"
-                      className="bg-blue-600"
-                      onClick={handleManualReconnect}
-                    >
-                      Refresh Connection
-                    </Button>
-                  </div>
-                )}
+          ) : error && !refreshingConnection ? (
+            <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
+              <div className="text-red-500 mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
+              <p className="text-gray-600 mb-4">{error}</p>
+              <div className="flex justify-center gap-4">
+                <Button onClick={handleManualReconnect}>
+                  Try Again
+                </Button>
+                <Button variant="outline" onClick={endCall}>
+                  End Call
+                </Button>
+                <Button variant="secondary" onClick={() => window.location.reload()}>
+                  Reload Page
+                </Button>
               </div>
             </div>
-            
-            {/* Call controls */}
-            <div className="p-4 bg-gray-900">
-              <Card className="p-4">
-                <div className="flex justify-between items-center">
-                  <div>
-                    <h2 className="font-semibold">{consultation?.doctor_name || 'Doctor'}</h2>
-                    <div className="text-sm text-gray-500">Consultation with {consultation?.patient_name || 'Patient'}</div>
+          ) : (
+            <Suspense fallback={
+              <div className="flex justify-center items-center h-full">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+              </div>
+            }>
+              <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
+                {/* Main video area */}
+                <div className="flex-1 relative overflow-hidden" onClick={handleManualPlay}>
+                  {/* Remote video (or waiting screen) */}
+                  <div className="w-full h-full relative">
+                    {/* Actual video element */}
+                    <video
+                      ref={remoteVideoRef}
+                      className={`w-full h-full object-cover ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`}
+                      autoPlay
+                      playsInline
+                    />
                     
-                    {callStatus === 'connected' && (
-                      <div className="flex items-center space-x-2 text-sm">
-                        <Clock className="h-4 w-4 text-green-600" />
-                        <span className="font-mono text-green-600">{formatDuration(callDuration)}</span>
-                        <Badge variant="default" className="bg-green-600">Live</Badge>
+                    {/* Waiting overlay when no remote video */}
+                    {(callStatus !== 'disconnected' && isWaitingForParticipant()) && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
+                        <div className="text-center space-y-4">
+                          <h2 className="text-2xl font-bold">Waiting for {remoteUserName}</h2>
+                          <p>The consultation will begin when they join</p>
+                          <div className="animate-pulse mt-8">
+                            <Phone className="h-16 w-16 mx-auto text-green-500" />
+                          </div>
+                          {connectionAttempts > 0 && (
+                            <div className="text-sm text-gray-400">
+                              Connection attempts: {connectionAttempts}
+                            </div>
+                          )}
+                          {refreshingConnection && (
+                            <div className="text-sm text-blue-400 animate-pulse">
+                              Refreshing connection...
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Disconnected overlay */}
+                    {callStatus === 'disconnected' && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-white">
+                        <div className="text-center space-y-4">
+                          <h2 className="text-2xl font-bold">Call Ended</h2>
+                          <p>{remoteUserName} has left the consultation</p>
+                          <Button 
+                            variant="outline" 
+                            className="mt-4"
+                            onClick={() => navigate('/')}
+                          >
+                            Return to Home
+                          </Button>
+                          <Button 
+                            variant="outline" 
+                            className="mt-4"
+                            onClick={handleManualReconnect}
+                          >
+                            Try to Reconnect
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Local video (PIP) */}
+                    <div className="absolute bottom-4 right-4 w-1/4 max-w-[200px] h-auto aspect-video rounded-lg overflow-hidden border-2 border-white">
+                      <video
+                        ref={localVideoRef}
+                        className="w-full h-full object-cover"
+                        autoPlay
+                        playsInline
+                        muted // Always mute local video to prevent feedback
+                      />
+                      
+                      {/* Video disabled indicator */}
+                      {!videoEnabled && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-70">
+                          <VideoOff className="text-white h-8 w-8" />
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Debug button - only in development */}
+                    <button
+                      onClick={debugVideoElements}
+                      className="absolute top-2 right-2 bg-gray-800 text-white text-xs px-2 py-1 rounded opacity-50 hover:opacity-100"
+                    >
+                      Debug
+                    </button>
+                    
+                    {/* Participant status indicators */}
+                    <div className="absolute top-2 left-2 flex flex-col gap-1">
+                      {doctorJoined && (
+                        <Badge variant="default" className="bg-green-600">Doctor Connected</Badge>
+                      )}
+                      {patientJoined && (
+                        <Badge variant="default" className="bg-green-600">Patient Connected</Badge>
+                      )}
+                      {connectionAttempts > 0 && (
+                        <Badge variant="outline" className="bg-blue-600 bg-opacity-50">Attempt #{connectionAttempts}</Badge>
+                      )}
+                    </div>
+                    
+                    {/* Error message */}
+                    {error && (
+                      <div className="absolute top-4 left-0 right-0 mx-auto max-w-sm bg-red-500 text-white p-2 rounded text-center">
+                        {error}
+                      </div>
+                    )}
+                    
+                    {/* Manual reconnect button when there are issues but not while actively reconnecting */}
+                    {error && !refreshingConnection && (
+                      <div className="absolute bottom-20 left-0 right-0 mx-auto text-center">
+                        <Button 
+                          variant="default"
+                          className="bg-blue-600"
+                          onClick={handleManualReconnect}
+                        >
+                          Refresh Connection
+                        </Button>
                       </div>
                     )}
                   </div>
-
-                  <div className="flex space-x-2">
-                    <Button 
-                      variant={videoEnabled ? "default" : "destructive"}
-                      size="icon" 
-                      onClick={toggleVideo}
-                    >
-                      {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
-                    </Button>
-                    
-                    <Button 
-                      variant={audioEnabled ? "default" : "destructive"}
-                      size="icon" 
-                      onClick={toggleAudio}
-                    >
-                      {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
-                    </Button>
-                    
-                    <Button 
-                      variant="destructive"
-                      size="icon" 
-                      onClick={endCall}
-                    >
-                      <PhoneOff className="h-4 w-4" />
-                    </Button>
-                  </div>
                 </div>
-              </Card>
-            </div>
-          </div>
-        )}
-      </main>
-    </div>
+                
+                {/* Call controls */}
+                <div className="p-4 bg-gray-900">
+                  <Card className="p-4">
+                    <div className="flex justify-between items-center">
+                      <div>
+                        <h2 className="font-semibold">{consultation?.doctor_name || 'Doctor'}</h2>
+                        <div className="text-sm text-gray-500">Consultation with {consultation?.patient_name || 'Patient'}</div>
+                        
+                        {callStatus === 'connected' && (
+                          <div className="flex items-center space-x-2 text-sm">
+                            <Clock className="h-4 w-4 text-green-600" />
+                            <span className="font-mono text-green-600">{formatDuration(callDuration)}</span>
+                            <Badge variant="default" className="bg-green-600">Live</Badge>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex space-x-2">
+                        <Button 
+                          variant={videoEnabled ? "default" : "destructive"}
+                          size="icon" 
+                          onClick={toggleVideo}
+                        >
+                          {videoEnabled ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
+                        </Button>
+                        
+                        <Button 
+                          variant={audioEnabled ? "default" : "destructive"}
+                          size="icon" 
+                          onClick={toggleAudio}
+                        >
+                          {audioEnabled ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
+                        </Button>
+                        
+                        <Button 
+                          variant="destructive"
+                          size="icon" 
+                          onClick={endCall}
+                        >
+                          <PhoneOff className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  </Card>
+                </div>
+              </div>
+            </Suspense>
+          )}
+        </main>
+      </div>
+    </VideoCallErrorBoundary>
   );
 };
 

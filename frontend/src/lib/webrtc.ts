@@ -136,6 +136,16 @@ interface SignalingMessage {
   target_user_id?: string;
 }
 
+// Defensive error handling wrapper for WebRTC operations
+function safeOperation<T>(operation: () => T, fallback: T, errorMessage: string): T {
+  try {
+    return operation();
+  } catch (error) {
+    console.error(errorMessage, error);
+    return fallback;
+  }
+}
+
 class WebRTCCall {
   private roomId: string;
   private appointmentId: string;
@@ -185,6 +195,12 @@ class WebRTCCall {
       // Request local media with explicit constraints for better quality
       try {
         console.log('Requesting media with constraints...');
+        
+        // Add defensive checks for browser compatibility
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error('Your browser does not support media devices access');
+        }
+        
         this.localStream = await navigator.mediaDevices.getUserMedia({ 
           video: {
             width: { ideal: 1280 },
@@ -231,13 +247,33 @@ class WebRTCCall {
           console.log('Got audio-only local media stream');
         } catch (audioError) {
           console.error('Failed to get any media stream:', audioError);
-          throw new Error('Cannot access camera or microphone');
+          
+          // Create an empty stream as a last resort to prevent null references
+          this.localStream = new MediaStream();
+          
+          // Notify about the error but don't throw - allow the call to continue
+          this.onErrorCallback?.(new Error('Cannot access camera or microphone. Please check your device permissions.'));
         }
       }
       
       // FIXED: Create RTCPeerConnection AFTER getting media to avoid issues
       try {
-        this.peerConnection = new RTCPeerConnection(PEER_CONFIG);
+        // First check if RTCPeerConnection is supported
+        if (typeof RTCPeerConnection === 'undefined') {
+          throw new Error('WebRTC is not supported in your browser');
+        }
+        
+        // Create a peer connection with error handling
+        this.peerConnection = safeOperation(
+          () => new RTCPeerConnection(PEER_CONFIG),
+          null,
+          'Failed to create peer connection'
+        );
+        
+        if (!this.peerConnection) {
+          throw new Error('Could not create WebRTC peer connection');
+        }
+        
         console.log('Created peer connection with config:', PEER_CONFIG);
       } catch (peerError) {
         console.error('Failed to create peer connection:', peerError);
@@ -269,7 +305,21 @@ class WebRTCCall {
       
       // Handle ICE candidates
       if (this.peerConnection) {
-        this.peerConnection.onicecandidate = event => {
+        // Use safer event handler assignment
+        const safelyAssignHandler = <K extends keyof RTCPeerConnection>(
+          property: K, 
+          handler: NonNullable<RTCPeerConnection[K]>
+        ) => {
+          try {
+            if (this.peerConnection) {
+              this.peerConnection[property] = handler;
+            }
+          } catch (e) {
+            console.error(`Error assigning handler to ${String(property)}:`, e);
+          }
+        };
+        
+        safelyAssignHandler('onicecandidate', event => {
           if (event.candidate) {
             console.log('Generated ICE candidate:', event.candidate);
             try {
@@ -284,15 +334,15 @@ class WebRTCCall {
           } else {
             console.log('All ICE candidates have been generated');
           }
-        };
+        });
         
         // Handle ICE gathering state change
-        this.peerConnection.onicegatheringstatechange = () => {
+        safelyAssignHandler('onicegatheringstatechange', () => {
           console.log('ICE gathering state:', this.peerConnection?.iceGatheringState);
-        };
+        });
         
         // Handle ICE connection state changes
-        this.peerConnection.oniceconnectionstatechange = () => {
+        safelyAssignHandler('oniceconnectionstatechange', () => {
           console.log('ICE connection state:', this.peerConnection?.iceConnectionState);
           
           if (this.peerConnection?.iceConnectionState === 'connected' || 
@@ -300,7 +350,13 @@ class WebRTCCall {
             if (!this.isConnected) {
               console.log('ICE connection established');
               this.isConnected = true;
-              this.onPeerConnectedCallback?.();
+              
+              // Wrap callback in try/catch
+              try {
+                this.onPeerConnectedCallback?.();
+              } catch (e) {
+                console.error('Error in peer connected callback:', e);
+              }
               
               // Reset reconnection attempts on successful connection
               this.reconnectAttempts = 0;
@@ -341,25 +397,25 @@ class WebRTCCall {
               this.tryReconnect();
             }
           }
-        };
+        });
         
         // Listen for connection state changes too
-        this.peerConnection.onconnectionstatechange = () => {
+        safelyAssignHandler('onconnectionstatechange', () => {
           console.log('Connection state:', this.peerConnection?.connectionState);
           if (this.peerConnection?.connectionState === 'connected') {
             console.log('Peer connection fully established');
             // Reset reconnection attempts on successful connection
             this.reconnectAttempts = 0;
           }
-        };
+        });
         
         // Monitor signaling state
-        this.peerConnection.onsignalingstatechange = () => {
+        safelyAssignHandler('onsignalingstatechange', () => {
           console.log('Signaling state:', this.peerConnection?.signalingState);
-        };
+        });
         
         // Handle remote tracks - CRITICAL FIX HERE
-        this.peerConnection.ontrack = event => {
+        safelyAssignHandler('ontrack', event => {
           console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled, 'readyState:', event.track.readyState);
           this.hasReceivedRemoteTrack = true;
           
@@ -421,7 +477,7 @@ class WebRTCCall {
             console.error('Error handling remote track:', trackError);
             // Don't rethrow - just log and continue
           }
-        };
+        });
       }
       
       // Share the local stream with the component
@@ -461,7 +517,9 @@ class WebRTCCall {
       } catch (callbackError) {
         console.error('Error in error callback:', callbackError);
       }
-      throw error;
+      
+      // Don't rethrow - let the app continue and try to recover
+      console.log('Attempting to continue despite initialization error');
     }
   }
   

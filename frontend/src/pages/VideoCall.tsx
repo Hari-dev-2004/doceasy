@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, Suspense, lazy } from "react";
+import React, { useEffect, useRef, useState, Suspense, lazy, StrictMode } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import axios from "axios";
 import { Badge } from "@/components/ui/badge";
@@ -92,6 +92,61 @@ class VideoCallErrorBoundary extends React.Component<
     return this.props.children;
   }
 }
+
+// Create a simplified video component to isolate rendering issues
+const SafeVideoElement = ({ 
+  videoRef, 
+  className, 
+  autoPlay = true, 
+  playsInline = true,
+  muted = false
+}: {
+  videoRef: React.RefObject<HTMLVideoElement>;
+  className?: string;
+  autoPlay?: boolean;
+  playsInline?: boolean;
+  muted?: boolean;
+}) => {
+  // Use a simple rendering approach to avoid complex React reconciliation issues
+  return (
+    <video
+      ref={videoRef}
+      className={className || ''}
+      autoPlay={autoPlay}
+      playsInline={playsInline}
+      muted={muted}
+      onError={(e) => {
+        console.error('Video element error:', e);
+      }}
+    />
+  );
+};
+
+// Add this function to safely handle stream assignment to video elements
+const safelyAssignStream = (videoRef: React.RefObject<HTMLVideoElement>, stream: MediaStream | null) => {
+  try {
+    if (!videoRef.current) return;
+    
+    // Check if the stream is the same to avoid unnecessary updates
+    if (videoRef.current.srcObject === stream) return;
+    
+    // Use setTimeout to avoid React rendering errors
+    setTimeout(() => {
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        
+        // Handle autoplay
+        if (stream) {
+          videoRef.current.play().catch(e => {
+            console.error('Error auto-playing video:', e);
+          });
+        }
+      }
+    }, 0);
+  } catch (error) {
+    console.error('Error assigning stream to video element:', error);
+  }
+};
 
 /**
  * VideoCall component for real-time WebRTC consultations
@@ -345,7 +400,8 @@ const VideoCall: React.FC = () => {
         onLocalStream: (stream) => {
           console.log('Got local stream in component');
           if (localVideoRef.current) {
-            localVideoRef.current.srcObject = stream;
+            // Use our safe method instead of direct assignment
+            safelyAssignStream(localVideoRef, stream);
             
             // Enable autoplay for mobile devices
             localVideoRef.current.onloadedmetadata = () => {
@@ -374,24 +430,8 @@ const VideoCall: React.FC = () => {
           }
           
           try {
-            remoteVideoRef.current.srcObject = stream;
-            
-            // Enable autoplay for mobile devices
-            remoteVideoRef.current.onloadedmetadata = () => {
-              console.log('Remote video metadata loaded');
-              if (remoteVideoRef.current) {
-                remoteVideoRef.current.play().catch(e => {
-                  console.error('Error auto-playing remote video:', e);
-                  // Try again with user interaction
-                  const playPromise = remoteVideoRef.current?.play();
-                  if (playPromise) {
-                    playPromise.catch(() => {
-                      console.log('Waiting for user interaction to play video');
-                    });
-                  }
-                });
-              }
-            };
+            // Use our safe method instead of direct assignment
+            safelyAssignStream(remoteVideoRef, stream);
             
             // Check if we have video tracks
             const videoTracks = stream.getVideoTracks();
@@ -843,71 +883,65 @@ const VideoCall: React.FC = () => {
 
   return (
     <VideoCallErrorBoundary>
-      <div className="flex flex-col min-h-screen bg-gray-50">
-        {/* Header */}
-        <header className="bg-white shadow-sm p-4">
-          <div className="max-w-7xl mx-auto flex justify-between items-center">
-            <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
-            <div className="flex items-center gap-2">
-              <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
-                {callStatus === 'connected' ? 'Connected' : 
-                 callStatus === 'connecting' ? 'Connecting...' : 
-                 callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
-              </Badge>
-              {callStatus === 'connected' && (
-                <Badge variant="outline" className="font-mono">
-                  <Clock className="w-3 h-3 mr-1" />
-                  {new Date(callDuration * 1000).toISOString().substr(11, 8)}
+      <StrictMode>
+        <div className="flex flex-col min-h-screen bg-gray-50">
+          {/* Header */}
+          <header className="bg-white shadow-sm p-4">
+            <div className="max-w-7xl mx-auto flex justify-between items-center">
+              <h1 className="text-xl font-semibold text-gray-800">Video Consultation</h1>
+              <div className="flex items-center gap-2">
+                <Badge variant={callStatus === 'connected' ? 'default' : callStatus === 'connecting' ? 'outline' : 'secondary'}>
+                  {callStatus === 'connected' ? 'Connected' : 
+                   callStatus === 'connecting' ? 'Connecting...' : 
+                   callStatus === 'waiting' ? 'Waiting...' : 'Disconnected'}
                 </Badge>
-              )}
+                {callStatus === 'connected' && (
+                  <Badge variant="outline" className="font-mono">
+                    <Clock className="w-3 h-3 mr-1" />
+                    {new Date(callDuration * 1000).toISOString().substr(11, 8)}
+                  </Badge>
+                )}
+              </div>
             </div>
-          </div>
-        </header>
+          </header>
 
-        {/* Main content */}
-        <main className="flex-grow p-4 relative">
-          {loading ? (
-            <div className="flex justify-center items-center h-full">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
-            </div>
-          ) : error && !refreshingConnection ? (
-            <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
-              <div className="text-red-500 mb-4">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-              </div>
-              <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
-              <p className="text-gray-600 mb-4">{error}</p>
-              <div className="flex justify-center gap-4">
-                <Button onClick={handleManualReconnect}>
-                  Try Again
-                </Button>
-                <Button variant="outline" onClick={endCall}>
-                  End Call
-                </Button>
-                <Button variant="secondary" onClick={() => window.location.reload()}>
-                  Reload Page
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <Suspense fallback={
+          {/* Main content */}
+          <main className="flex-grow p-4 relative">
+            {loading ? (
               <div className="flex justify-center items-center h-full">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
               </div>
-            }>
+            ) : error && !refreshingConnection ? (
+              <div className="max-w-3xl mx-auto bg-white p-6 rounded-lg shadow-md text-center">
+                <div className="text-red-500 mb-4">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </div>
+                <h2 className="text-xl font-semibold text-gray-800 mb-2">Connection Error</h2>
+                <p className="text-gray-600 mb-4">{error}</p>
+                <div className="flex justify-center gap-4">
+                  <Button onClick={handleManualReconnect}>
+                    Try Again
+                  </Button>
+                  <Button variant="outline" onClick={endCall}>
+                    End Call
+                  </Button>
+                  <Button variant="secondary" onClick={() => window.location.reload()}>
+                    Reload Page
+                  </Button>
+                </div>
+              </div>
+            ) : (
               <div className="video-call-container h-screen w-full flex flex-col overflow-hidden bg-gradient-to-br from-gray-900 to-black relative">
                 {/* Main video area */}
                 <div className="flex-1 relative overflow-hidden" onClick={handleManualPlay}>
                   {/* Remote video (or waiting screen) */}
                   <div className="w-full h-full relative">
-                    {/* Actual video element */}
-                    <video
-                      ref={remoteVideoRef}
+                    {/* Use the simplified video component */}
+                    <SafeVideoElement 
+                      videoRef={remoteVideoRef}
                       className={`w-full h-full object-cover ${hasRemoteVideo ? 'opacity-100' : 'opacity-0'}`}
-                      autoPlay
-                      playsInline
                     />
                     
                     {/* Waiting overlay when no remote video */}
@@ -959,12 +993,11 @@ const VideoCall: React.FC = () => {
                     
                     {/* Local video (PIP) */}
                     <div className="absolute bottom-4 right-4 w-1/4 max-w-[200px] h-auto aspect-video rounded-lg overflow-hidden border-2 border-white">
-                      <video
-                        ref={localVideoRef}
+                      {/* Use the simplified video component */}
+                      <SafeVideoElement
+                        videoRef={localVideoRef}
                         className="w-full h-full object-cover"
-                        autoPlay
-                        playsInline
-                        muted // Always mute local video to prevent feedback
+                        muted={true}
                       />
                       
                       {/* Video disabled indicator */}
@@ -1064,10 +1097,10 @@ const VideoCall: React.FC = () => {
                   </Card>
                 </div>
               </div>
-            </Suspense>
-          )}
-        </main>
-      </div>
+            )}
+          </main>
+        </div>
+      </StrictMode>
     </VideoCallErrorBoundary>
   );
 };

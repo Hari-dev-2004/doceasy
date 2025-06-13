@@ -146,6 +146,29 @@ function safeOperation<T>(operation: () => T, fallback: T, errorMessage: string)
   }
 }
 
+// Add a new utility function to safely handle media streams
+function createSafeMediaStream(): MediaStream {
+  try {
+    return new MediaStream();
+  } catch (error) {
+    console.error('Failed to create MediaStream:', error);
+    // Return a mock stream object that won't crash when used
+    return {
+      id: 'mock-stream-' + Date.now(),
+      active: false,
+      addTrack: () => {},
+      clone: () => createSafeMediaStream(),
+      getAudioTracks: () => [],
+      getVideoTracks: () => [],
+      getTracks: () => [],
+      removeTrack: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true
+    } as unknown as MediaStream;
+  }
+}
+
 class WebRTCCall {
   private roomId: string;
   private appointmentId: string;
@@ -423,10 +446,10 @@ class WebRTCCall {
             // Ensure the track is enabled
             event.track.enabled = true;
             
-            // Add track to remote stream
+            // Add track to remote stream using our safe method
             if (!this.remoteStream) {
               // If somehow remoteStream is null, create a new one
-              this.remoteStream = new MediaStream();
+              this.remoteStream = createSafeMediaStream();
             }
 
             // FIXED: Always use event.streams[0] if available, this is critical for proper stream handling
@@ -440,38 +463,51 @@ class WebRTCCall {
                 track.enabled = true;
               });
               
-              // FIXED: Replace remoteStream with the one from the event to maintain synchronization
-              this.remoteStream = event.streams[0];
+              // FIXED: Use our safe update method instead of direct assignment
+              this.updateRemoteStreamSafely(event.streams[0]);
             } else {
               // Fallback: manually add track if event.streams is not available
               console.log('No event streams, manually adding track to remote stream');
-              this.remoteStream.addTrack(event.track);
+              if (this.remoteStream) {
+                try {
+                  this.remoteStream.addTrack(event.track);
+                } catch (e) {
+                  console.error('Failed to add track to remote stream:', e);
+                  // Create a new stream and add the track
+                  const newStream = createSafeMediaStream();
+                  try {
+                    newStream.addTrack(event.track);
+                    this.updateRemoteStreamSafely(newStream);
+                  } catch (e2) {
+                    console.error('Failed to add track to new stream:', e2);
+                  }
+                }
+              }
             }
             
             // Debug log remote stream
-            console.log('Remote stream now has tracks:', 
-                       this.remoteStream.getVideoTracks().length, 'video,', 
-                       this.remoteStream.getAudioTracks().length, 'audio');
+            if (this.remoteStream) {
+              console.log('Remote stream now has tracks:', 
+                         this.remoteStream.getVideoTracks().length, 'video,', 
+                         this.remoteStream.getAudioTracks().length, 'audio');
+            }
             
             // FIXED: Always notify about the remote stream when we get a track
-            if (this.onRemoteStreamCallback) {
-              console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
-              try {
-                this.onRemoteStreamCallback(this.remoteStream);
-              } catch (e) {
-                console.error('Error in remote stream callback:', e);
-              }
-            }
+            // This is now handled by updateRemoteStreamSafely
             
             // Ensure we mark as connected when we get tracks
             if (!this.isConnected) {
               console.log('Track received, marking as connected');
               this.isConnected = true;
-              try {
-                this.onPeerConnectedCallback?.();
-              } catch (e) {
-                console.error('Error in peer connected callback:', e);
-              }
+              
+              // Use setTimeout to avoid React rendering issues
+              setTimeout(() => {
+                try {
+                  this.onPeerConnectedCallback?.();
+                } catch (e) {
+                  console.error('Error in peer connected callback:', e);
+                }
+              }, 0);
             }
           } catch (trackError) {
             console.error('Error handling remote track:', trackError);
@@ -1450,6 +1486,56 @@ class WebRTCCall {
   
   // Track last poll time
   private _lastPollTime: number = 0;
+
+  /**
+   * Safely updates the remote stream to prevent React rendering errors
+   */
+  private updateRemoteStreamSafely(newStream: MediaStream | null): void {
+    try {
+      // Don't update if the streams are the same object
+      if (this.remoteStream === newStream) return;
+      
+      // If we're setting to null, just do it directly
+      if (!newStream) {
+        this.remoteStream = null;
+        return;
+      }
+      
+      // Create a new stream to avoid direct mutation
+      const safeStream = createSafeMediaStream();
+      
+      // Copy tracks from the new stream to our safe stream
+      if (newStream.getTracks) {
+        const tracks = safeOperation(() => newStream.getTracks(), [], 'Failed to get tracks from new stream');
+        tracks.forEach(track => {
+          try {
+            safeStream.addTrack(track);
+          } catch (e) {
+            console.error('Failed to add track to safe stream:', e);
+          }
+        });
+      }
+      
+      // Update the remote stream reference
+      this.remoteStream = safeStream;
+      
+      // Notify about the stream change
+      if (this.onRemoteStreamCallback) {
+        try {
+          // Use setTimeout to avoid React rendering issues
+          setTimeout(() => {
+            if (this.remoteStream && this.onRemoteStreamCallback) {
+              this.onRemoteStreamCallback(this.remoteStream);
+            }
+          }, 0);
+        } catch (e) {
+          console.error('Error in remote stream callback:', e);
+        }
+      }
+    } catch (error) {
+      console.error('Error updating remote stream:', error);
+    }
+  }
 }
 
 export default WebRTCCall; 

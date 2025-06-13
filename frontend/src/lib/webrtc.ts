@@ -93,14 +93,24 @@ class WebRTCCall {
             height: { ideal: 720 },
             facingMode: 'user'
           }, 
-          audio: true 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
         console.log('Got local media stream:', this.localStream);
       } catch (mediaError) {
         console.error('Failed to get video, trying audio only:', mediaError);
         // Fallback to audio only
         try {
-          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          this.localStream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
           console.log('Got audio-only local media stream');
         } catch (audioError) {
           console.error('Failed to get any media stream:', audioError);
@@ -116,12 +126,12 @@ class WebRTCCall {
       console.log('Created peer connection with config:', PEER_CONFIG);
       
       // Add local tracks to peer connection
-      this.localStream.getTracks().forEach(track => {
-        if (this.localStream && this.peerConnection) {
+      if (this.localStream && this.peerConnection) {
+        this.localStream.getTracks().forEach(track => {
           console.log('Adding track to peer connection:', track.kind, track.id, track.enabled);
-          this.peerConnection.addTrack(track, this.localStream);
-        }
-      });
+          this.peerConnection?.addTrack(track, this.localStream!);
+        });
+      }
       
       // Handle ICE candidates
       this.peerConnection.onicecandidate = event => {
@@ -184,19 +194,33 @@ class WebRTCCall {
         console.log('Received remote track:', event.track.kind, event.track.id, event.track.enabled);
         this.hasReceivedRemoteTrack = true;
         
-        // Always add to our remote stream
+        // Add each track to our remote stream
         if (this.remoteStream) {
-          event.track.onunmute = () => {
-            console.log('Remote track unmuted:', event.track.kind);
-          };
+          // Make sure we add tracks that aren't already in the stream
+          const existingTrack = this.remoteStream.getTracks().find(t => 
+            t.id === event.track.id && t.kind === event.track.kind
+          );
           
-          this.remoteStream.addTrack(event.track);
-        }
-        
-        // Notify about the remote stream
-        if (this.remoteStream && this.onRemoteStreamCallback) {
-          console.log('Calling onRemoteStream callback with stream:', this.remoteStream.id);
-          this.onRemoteStreamCallback(this.remoteStream);
+          if (!existingTrack) {
+            console.log(`Adding ${event.track.kind} track to remote stream`);
+            this.remoteStream.addTrack(event.track);
+            
+            // Notify when track starts playing
+            event.track.onunmute = () => {
+              console.log(`Remote ${event.track.kind} track unmuted and playing`);
+            };
+            
+            // Listen for track mute/unmute events
+            event.track.onmute = () => {
+              console.log(`Remote ${event.track.kind} track muted`);
+            };
+            
+            // Notify about the remote stream for every new track
+            if (this.remoteStream && this.onRemoteStreamCallback) {
+              console.log(`Calling onRemoteStream callback with stream containing ${this.remoteStream.getTracks().length} tracks`);
+              this.onRemoteStreamCallback(this.remoteStream);
+            }
+          }
         }
       };
       
@@ -458,11 +482,21 @@ class WebRTCCall {
         await this.peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp));
         console.log('Set remote description from answer');
         
-      } else if (signal.type === 'candidate') {
+      } else if (signal.type === 'candidate' && signal.candidate) {
         console.log('Received ICE candidate from remote peer');
-        // Add ICE candidate
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(signal.candidate));
-        console.log('Added ICE candidate');
+        try {
+          // Make sure the candidate is properly formatted
+          const candidate = new RTCIceCandidate(signal.candidate);
+          // Add ICE candidate only if we have a remote description already set
+          if (this.peerConnection.remoteDescription && this.peerConnection.remoteDescription.type) {
+            await this.peerConnection.addIceCandidate(candidate);
+            console.log('Added ICE candidate successfully');
+          } else {
+            console.log('Skipping ICE candidate as remote description is not set yet');
+          }
+        } catch (e) {
+          console.error('Error adding ICE candidate:', e);
+        }
       }
       
     } catch (error) {
@@ -502,10 +536,36 @@ class WebRTCCall {
       const videoTracks = this.localStream.getVideoTracks();
       console.log(`Toggling video to ${enabled ? 'enabled' : 'disabled'}, ${videoTracks.length} tracks`);
       
-      videoTracks.forEach(track => {
-        track.enabled = enabled;
-        console.log(`Set video track ${track.id} enabled to ${track.enabled}`);
-      });
+      if (videoTracks.length === 0 && enabled) {
+        // Try to get video if we don't have it yet but user wants to enable
+        navigator.mediaDevices.getUserMedia({ 
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: 'user'
+          }
+        }).then(stream => {
+          const videoTrack = stream.getVideoTracks()[0];
+          if (videoTrack && this.peerConnection && this.localStream) {
+            this.localStream.addTrack(videoTrack);
+            this.peerConnection.addTrack(videoTrack, this.localStream);
+            console.log(`Added new video track: ${videoTrack.id}`);
+            
+            // Update UI
+            if (this.onLocalStreamCallback) {
+              this.onLocalStreamCallback(this.localStream);
+            }
+          }
+        }).catch(err => {
+          console.error('Failed to get video track:', err);
+        });
+      } else {
+        // Toggle existing tracks
+        videoTracks.forEach(track => {
+          track.enabled = enabled;
+          console.log(`Set video track ${track.id} enabled to ${track.enabled}`);
+        });
+      }
     } else {
       console.warn('Cannot toggle video: no local stream');
     }
@@ -519,10 +579,31 @@ class WebRTCCall {
       const audioTracks = this.localStream.getAudioTracks();
       console.log(`Toggling audio to ${enabled ? 'enabled' : 'disabled'}, ${audioTracks.length} tracks`);
       
-      audioTracks.forEach(track => {
-        track.enabled = enabled;
-        console.log(`Set audio track ${track.id} enabled to ${track.enabled}`);
-      });
+      if (audioTracks.length === 0 && enabled) {
+        // Try to get audio if we don't have it yet but user wants to enable
+        navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        }).then(stream => {
+          const audioTrack = stream.getAudioTracks()[0];
+          if (audioTrack && this.peerConnection && this.localStream) {
+            this.localStream.addTrack(audioTrack);
+            this.peerConnection.addTrack(audioTrack, this.localStream);
+            console.log(`Added new audio track: ${audioTrack.id}`);
+          }
+        }).catch(err => {
+          console.error('Failed to get audio track:', err);
+        });
+      } else {
+        // Toggle existing tracks
+        audioTracks.forEach(track => {
+          track.enabled = enabled;
+          console.log(`Set audio track ${track.id} enabled to ${track.enabled}`);
+        });
+      }
     } else {
       console.warn('Cannot toggle audio: no local stream');
     }

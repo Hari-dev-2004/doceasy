@@ -2,13 +2,13 @@ import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_mail import Mail
-from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import timedelta
 import logging
 from models import Admin
 from routes import auth_bp, admin_bp, api_bp, doctor_bp, patient_bp, payment_bp
 import time
+import mongodb_config
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -45,27 +45,14 @@ def create_app():
     # Initialize Flask-Mail
     mail = Mail(app)
     
-    # MongoDB configuration
-    # Use MongoDB Atlas URI in production, local MongoDB in development
-    mongodb_uri = os.getenv('MONGODB_URI', 'mongodb+srv://subrahmanyag79:dhDShm338VxoPMUz@doceasy.kp4oh2g.mongodb.net/?retryWrites=true&w=majority&appName=doceasy')
-    mongodb_db_name = os.getenv('MONGODB_DB_NAME', 'doceasy')
+    # MongoDB configuration - use the centralized configuration
+    db = mongodb_config.get_db()
+    app.config['DATABASE'] = db
     
-    # Connect to MongoDB
-    try:
-        # Explicitly use the Atlas URI
-        client = MongoClient(mongodb_uri)
-        # Get the database by name instead of default
-        db = client[mongodb_db_name]
-        app.config['DATABASE'] = db
-        
-        # Test connection
-        client.admin.command('ping')
-        logger.info(f"Connected to MongoDB database: {mongodb_db_name} at {mongodb_uri}")
-    except Exception as e:
-        logger.error(f"Failed to connect to MongoDB: {e}")
-        # Don't raise the exception, allow the app to start anyway
-        # This helps with debugging connection issues
-        app.config['DATABASE'] = None
+    if db is not None:
+        logger.info("MongoDB database connection established in Flask app")
+    else:
+        logger.error("Failed to establish MongoDB connection in Flask app")
     
     # CORS configuration - allow production frontend and development origins
     cors_origins = os.getenv('CORS_ORIGIN', 'https://doceasy-1.onrender.com,http://localhost:5173,http://localhost:8080,http://localhost:3000').split(',')
@@ -121,7 +108,7 @@ def create_app():
             return jsonify({
                 'status': 'healthy',
                 'database': db_status,
-                'mongodb_uri': mongodb_uri[:20] + '...' if mongodb_uri else 'not set',
+                'mongodb_uri': mongodb_config.MONGODB_URI[:20] + '...' if mongodb_config.MONGODB_URI else 'not set',
                 'jwt_expiry_hours': int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', 168))
             }), 200
         except Exception as e:

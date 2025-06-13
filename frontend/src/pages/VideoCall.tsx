@@ -333,11 +333,16 @@ const VideoCall = () => {
           
           if (localVideoRef.current) {
             localVideoRef.current.srcObject = stream;
-            setHasLocalVideo(true);
+            setHasLocalVideo(stream.getVideoTracks().length > 0);
             
             // Ensure video tracks are properly enabled
             stream.getVideoTracks().forEach(track => {
               track.enabled = videoEnabled;
+            });
+            
+            // Ensure audio tracks are properly enabled
+            stream.getAudioTracks().forEach(track => {
+              track.enabled = audioEnabled;
             });
             
             // Force play on mobile devices
@@ -354,20 +359,28 @@ const VideoCall = () => {
           
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = stream;
-            setHasRemoteVideo(true);
+            setHasRemoteVideo(stream.getVideoTracks().length > 0 && stream.getVideoTracks()[0].enabled);
             
             // Force play the video
             remoteVideoRef.current.play().catch(e => {
               console.warn("Remote video autoplay failed:", e);
               // Try again after a user gesture
               const unlockAudioAndVideo = () => {
-                remoteVideoRef.current?.play();
+                remoteVideoRef.current?.play().catch(err => {
+                  console.error("Failed to play remote video after user gesture:", err);
+                });
                 document.body.removeEventListener('click', unlockAudioAndVideo);
                 document.body.removeEventListener('touchstart', unlockAudioAndVideo);
               };
               
               document.body.addEventListener('click', unlockAudioAndVideo);
               document.body.addEventListener('touchstart', unlockAudioAndVideo);
+              
+              // Show a toast to prompt user action
+              toast({
+                title: "Action Required",
+                description: "Please tap anywhere on the screen to enable audio",
+              });
             });
           }
           setConnectionStatus('Connected');
@@ -460,6 +473,12 @@ const VideoCall = () => {
     
     if (webrtcRef.current) {
       webrtcRef.current.toggleVideo(newVideoState);
+      
+      // Update local video display immediately
+      if (localVideoRef.current && webrtcRef.current.localStream) {
+        const videoTracks = webrtcRef.current.localStream.getVideoTracks();
+        setHasLocalVideo(videoTracks.length > 0 && newVideoState);
+      }
     }
     
     toast({
@@ -646,6 +665,11 @@ const VideoCall = () => {
                           {reconnectAttempts > 0 && (
                             <p className="text-gray-400 mt-1 text-sm">Reconnection attempt {reconnectAttempts}/3</p>
                           )}
+                          {connectionStatus === 'Connected' && !hasRemoteVideo && (
+                            <p className="text-white mt-3">
+                              {otherParticipantName} is connected but their camera is off
+                            </p>
+                          )}
                         </div>
                       )}
 
@@ -732,6 +756,15 @@ const VideoCall = () => {
                     <Badge variant="outline" className="bg-black/50 text-white border-none text-xs">
                       <VideoOff className="h-3 w-3 mr-1" />
                       Off
+                    </Badge>
+                  </div>
+                )}
+                
+                {!audioEnabled && (
+                  <div className="absolute top-2 left-2">
+                    <Badge variant="outline" className="bg-black/50 text-white border-none text-xs">
+                      <MicOff className="h-3 w-3 mr-1" />
+                      Muted
                     </Badge>
                   </div>
                 )}
